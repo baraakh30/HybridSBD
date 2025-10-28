@@ -1,0 +1,12 @@
+venv/
+test_results/
+__pycache__/
+*.pyc
+*.npy
+*.pyo
+*.pyd
+training_features/
+output/
+logs/
+models/
+data/
