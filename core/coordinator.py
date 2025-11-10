@@ -101,7 +101,9 @@ class ProcessingCoordinator:
                 "hsv_histogram",
                 bins=feature_config.hsv_bins,
                 smoothing=feature_config.hsv_smoothing,
-                device=self.config.processing.device
+                device=self.config.processing.device,
+                frame_sampling_rate=getattr(feature_config, 'hsv_frame_sampling_rate', 1),
+                interpolation_method=getattr(feature_config, 'hsv_interpolation_method', 'linear')
             )
             self.logger.info("Initialized HSV histogram extractor")
         

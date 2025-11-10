@@ -14,6 +14,8 @@ class FeatureConfig:
     hsv_enabled: bool = True
     hsv_bins: int = 256
     hsv_smoothing: bool = True
+    hsv_frame_sampling_rate: int = 1  # Process every Nth frame for HSV (1 = all frames)
+    hsv_interpolation_method: str = "linear"
     
     cnn_enabled: bool = True
     cnn_model: str = "resnet50"

@@ -1,6 +1,12 @@
 """
 Analyze correlation and Euclidean distance between consecutive frames for each feature type.
 This script helps determine which feature type shows the strongest signal for shot boundary detection.
+
+Runs analysis for two sampling rates:
+1. No sampling (rate=1) - all frames processed
+2. High sampling (rate=8) - every 8th frame processed
+
+Applies smoothing filters to better visualize peaks and troughs.
 """
 
 import numpy as np
@@ -9,6 +15,8 @@ import os
 import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy.stats import pearsonr
+from scipy.ndimage import gaussian_filter1d, maximum_filter1d, minimum_filter1d
+from scipy.signal import savgol_filter
 from typing import List, Tuple, Dict
 import warnings
 warnings.filterwarnings('ignore')
@@ -16,8 +24,19 @@ warnings.filterwarnings('ignore')
 # Hardcoded configuration from train_transformer.py usage
 VIDEO_DIR = r"C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train"
 GROUND_TRUTH_FILE = r"C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json"
-FEATURES_DIR = "training_features"
-OUTPUT_DIR = "feature_analysis_results"
+
+# Feature directories for different sampling rates
+FEATURES_DIRS = {
+    'no_sampling': 'training_features_no_sampling',
+    'sampling_8': 'training_features_sampling_8'
+}
+
+# Main output directory (sampling subdirectories will be created within video folders)
+OUTPUT_DIR = 'feature_analysis_results'
+
+# Smoothing parameters
+SMOOTHING_WINDOW = 5  # Window size for smoothing filters
+SMOOTHING_METHOD = 'gaussian'  # 'gaussian', 'savgol', or 'none'
 
 # Feature types to analyze (individual features, not fused)
 FEATURE_TYPES = ['cnn', 'hsv_histogram', 'clip', 'optical_flow']
@@ -66,6 +85,10 @@ def calculate_correlation(features: np.ndarray) -> np.ndarray:
     Returns:
         Array of shape (N-1,) with correlation coefficients between consecutive frames
     """
+    # Convert to float32 if needed for better numerical stability
+    if features.dtype == np.float16:
+        features = features.astype(np.float32)
+    
     correlations = []
     
     for i in range(len(features) - 1):
@@ -81,7 +104,7 @@ def calculate_correlation(features: np.ndarray) -> np.ndarray:
         
         correlations.append(corr)
     
-    return np.array(correlations)
+    return np.array(correlations, dtype=np.float32)
 
 
 def calculate_euclidean_distance(features: np.ndarray) -> np.ndarray:
@@ -94,6 +117,10 @@ def calculate_euclidean_distance(features: np.ndarray) -> np.ndarray:
     Returns:
         Array of shape (N-1,) with Euclidean distances between consecutive frames
     """
+    # Convert to float32 if needed for better numerical stability
+    if features.dtype == np.float16:
+        features = features.astype(np.float32)
+    
     distances = []
     
     for i in range(len(features) - 1):
@@ -104,363 +131,411 @@ def calculate_euclidean_distance(features: np.ndarray) -> np.ndarray:
         dist = np.linalg.norm(frame1 - frame2)
         distances.append(dist)
     
-    return np.array(distances)
+    return np.array(distances, dtype=np.float32)
 
 
-def plot_video_analysis(video_name: str, frame_count: int, boundaries: List[int],
-                        results: Dict[str, Dict], output_dir: str):
+def apply_smoothing(signal: np.ndarray, window_size: int = 5, method: str = 'gaussian') -> np.ndarray:
+    """
+    Apply smoothing filter to a 1D signal to better visualize peaks and troughs.
+    
+    Args:
+        signal: 1D array to smooth
+        window_size: Size of the smoothing window
+        method: Smoothing method ('gaussian', 'savgol', 'none')
+        
+    Returns:
+        Smoothed signal of same shape
+    """
+    if method == 'none' or len(signal) < window_size:
+        return signal
+    
+    # Convert to float32 if needed (scipy doesn't support float16)
+    original_dtype = signal.dtype
+    if signal.dtype == np.float16:
+        signal = signal.astype(np.float32)
+    
+    if method == 'gaussian':
+        # Gaussian filter - good for general smoothing
+        sigma = window_size / 3.0  # Standard deviation
+        smoothed = gaussian_filter1d(signal, sigma=sigma, mode='nearest')
+    
+    elif method == 'savgol':
+        # Savitzky-Golay filter - preserves peaks better
+        # Window size must be odd
+        if window_size % 2 == 0:
+            window_size += 1
+        # Polynomial order (must be less than window_size)
+        polyorder = min(3, window_size - 1)
+        smoothed = savgol_filter(signal, window_length=window_size, polyorder=polyorder, mode='nearest')
+    
+    else:
+        return signal
+    
+    # Convert back to original dtype if it was float16
+    if original_dtype == np.float16:
+        smoothed = smoothed.astype(np.float16)
+    
+    return smoothed
+
+
+def plot_video_analysis(video_name: str, video_id: int, frame_count: int, boundaries: List[int],
+                        results: Dict[str, Dict], output_dir: str, sampling_label: str = ""):
     """
     Create plots for a single video showing correlation and distance for all features.
+    Now includes both raw and smoothed signals.
     
     Args:
         video_name: Name of the video
+        video_id: Numeric ID of the video (1-10)
         frame_count: Total number of frames
         boundaries: List of boundary frame indices
         results: Dictionary with results for each feature type
-        output_dir: Directory to save plots
+        output_dir: Directory to save plots (sampling-specific directory)
+        sampling_label: Label for sampling rate (e.g., "no_sampling" or "sampling_8")
     """
-    # Create video-specific directory
-    video_dir = os.path.join(output_dir, video_name)
-    os.makedirs(video_dir, exist_ok=True)
+    # Output directory is already sampling-specific (e.g., video_name/no_sampling/)
+    os.makedirs(output_dir, exist_ok=True)
     
     num_features = len(FEATURE_TYPES)
     
-    # Plot 1: Individual correlation plots for each feature
-    for feature_type in FEATURE_TYPES:
-        if feature_type not in results:
-            continue
-        
-        correlations = results[feature_type]['correlation']
-        
-        plt.figure(figsize=(14, 5))
-        frames = np.arange(1, len(correlations) + 1)
-        
-        plt.plot(frames, correlations, linewidth=1.5, color='blue', alpha=0.7)
-        plt.xlabel('Frame Index', fontsize=12)
-        plt.ylabel('Correlation Coefficient', fontsize=12)
-        plt.title(f'{video_name} - {feature_type.upper()} Correlation', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(correlations):
-                plt.axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Boundary' if boundary == boundaries[0] else '')
-        
-        if boundaries:
-            plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(video_dir, f'{feature_type}_correlation.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    # Plot 2: Individual distance plots for each feature
-    for feature_type in FEATURE_TYPES:
-        if feature_type not in results:
-            continue
-        
-        distances = results[feature_type]['distance']
-        
-        plt.figure(figsize=(14, 5))
-        frames = np.arange(1, len(distances) + 1)
-        
-        plt.plot(frames, distances, linewidth=1.5, color='green', alpha=0.7)
-        plt.xlabel('Frame Index', fontsize=12)
-        plt.ylabel('Euclidean Distance', fontsize=12)
-        plt.title(f'{video_name} - {feature_type.upper()} Euclidean Distance', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(distances):
-                plt.axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Boundary' if boundary == boundaries[0] else '')
-        
-        if boundaries:
-            plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(video_dir, f'{feature_type}_distance.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    # Plot 3: Combined correlation plot (all features on one plot)
-    fig, axes = plt.subplots(num_features, 1, figsize=(14, 3 * num_features), sharex=True)
-    if num_features == 1:
-        axes = [axes]
-    
-    for idx, feature_type in enumerate(FEATURE_TYPES):
-        if feature_type not in results:
-            continue
-        
-        correlations = results[feature_type]['correlation']
-        frames = np.arange(1, len(correlations) + 1)
-        
-        axes[idx].plot(frames, correlations, linewidth=1.5, alpha=0.7)
-        axes[idx].set_ylabel('Correlation', fontsize=10)
-        axes[idx].set_title(f'{feature_type.upper()}', fontsize=11, fontweight='bold')
-        axes[idx].grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(correlations):
-                axes[idx].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
-    
-    axes[-1].set_xlabel('Frame Index', fontsize=12)
-    fig.suptitle(f'{video_name} - All Features Correlation', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(video_dir, 'all_features_correlation.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # Plot 4: Combined distance plot (all features on one plot)
-    fig, axes = plt.subplots(num_features, 1, figsize=(14, 3 * num_features), sharex=True)
-    if num_features == 1:
-        axes = [axes]
-    
-    for idx, feature_type in enumerate(FEATURE_TYPES):
-        if feature_type not in results:
-            continue
-        
-        distances = results[feature_type]['distance']
-        frames = np.arange(1, len(distances) + 1)
-        
-        axes[idx].plot(frames, distances, linewidth=1.5, alpha=0.7, color='green')
-        axes[idx].set_ylabel('Distance', fontsize=10)
-        axes[idx].set_title(f'{feature_type.upper()}', fontsize=11, fontweight='bold')
-        axes[idx].grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(distances):
-                axes[idx].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
-    
-    axes[-1].set_xlabel('Frame Index', fontsize=12)
-    fig.suptitle(f'{video_name} - All Features Euclidean Distance', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(video_dir, 'all_features_distance.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # Plot 5: Side-by-side comparison (correlation and distance) for each feature
+    # Plot 5: Side-by-side comparison with smoothing (correlation and distance) for each feature
     for feature_type in FEATURE_TYPES:
         if feature_type not in results:
             continue
         
         correlations = results[feature_type]['correlation']
         distances = results[feature_type]['distance']
+        
+        # Apply smoothing
+        correlations_smooth = apply_smoothing(correlations, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+        distances_smooth = apply_smoothing(distances, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+        
         frames = np.arange(1, len(correlations) + 1)
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+        fig, axes = plt.subplots(2, 2, figsize=(18, 10), sharex='col')
         
-        # Correlation subplot
-        ax1.plot(frames, correlations, linewidth=1.5, color='blue', alpha=0.7)
-        ax1.set_ylabel('Correlation Coefficient', fontsize=11)
-        ax1.set_title('Correlation Between Consecutive Frames', fontsize=12, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
+        # Top-left: Raw correlation
+        axes[0, 0].plot(frames, correlations, linewidth=1.5, color='blue', alpha=0.5, label='Raw')
+        axes[0, 0].plot(frames, correlations_smooth, linewidth=2, color='darkblue', alpha=0.9, label='Smoothed')
+        axes[0, 0].set_ylabel('Correlation Coefficient', fontsize=11)
+        axes[0, 0].set_title('Correlation (Raw vs Smoothed)', fontsize=12, fontweight='bold')
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].legend()
         
         # Add vertical lines for boundaries
         for boundary in boundaries:
             if boundary < len(correlations):
-                ax1.axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+                axes[0, 0].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
         
-        # Distance subplot
-        ax2.plot(frames, distances, linewidth=1.5, color='green', alpha=0.7)
-        ax2.set_ylabel('Euclidean Distance', fontsize=11)
-        ax2.set_xlabel('Frame Index', fontsize=11)
-        ax2.set_title('Euclidean Distance Between Consecutive Frames', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
+        # Top-right: Raw distance
+        axes[0, 1].plot(frames, distances, linewidth=1.5, color='green', alpha=0.5, label='Raw')
+        axes[0, 1].plot(frames, distances_smooth, linewidth=2, color='darkgreen', alpha=0.9, label='Smoothed')
+        axes[0, 1].set_ylabel('Euclidean Distance', fontsize=11)
+        axes[0, 1].set_title('Distance (Raw vs Smoothed)', fontsize=12, fontweight='bold')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].legend()
         
         # Add vertical lines for boundaries
         for boundary in boundaries:
             if boundary < len(distances):
-                ax2.axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7, 
+                axes[0, 1].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        
+        # Bottom-left: Smoothed correlation only
+        axes[1, 0].plot(frames, correlations_smooth, linewidth=2, color='darkblue', alpha=0.9)
+        axes[1, 0].set_ylabel('Correlation Coefficient', fontsize=11)
+        axes[1, 0].set_xlabel('Frame Index', fontsize=11)
+        axes[1, 0].set_title('Smoothed Correlation Only', fontsize=12, fontweight='bold')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Add vertical lines for boundaries
+        for boundary in boundaries:
+            if boundary < len(correlations):
+                axes[1, 0].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        
+        # Bottom-right: Smoothed distance only
+        axes[1, 1].plot(frames, distances_smooth, linewidth=2, color='darkgreen', alpha=0.9)
+        axes[1, 1].set_ylabel('Euclidean Distance', fontsize=11)
+        axes[1, 1].set_xlabel('Frame Index', fontsize=11)
+        axes[1, 1].set_title('Smoothed Distance Only', fontsize=12, fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Add vertical lines for boundaries
+        for boundary in boundaries:
+            if boundary < len(distances):
+                axes[1, 1].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7, 
                           label='Boundary' if boundary == boundaries[0] else '')
         
         if boundaries:
-            ax2.legend()
+            axes[1, 1].legend()
         
-        fig.suptitle(f'{video_name} - {feature_type.upper()} Side-by-Side Comparison', 
+        sampling_suffix = f"_{sampling_label}" if sampling_label else ""
+        fig.suptitle(f'Video {video_id} - {feature_type.upper()} with Smoothing ({SMOOTHING_METHOD})', 
                     fontsize=14, fontweight='bold', y=0.995)
         plt.tight_layout()
-        plt.savefig(os.path.join(video_dir, f'{feature_type}_side_by_side.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, f'{feature_type}_smoothed_comparison.png'), dpi=150, bbox_inches='tight')
         plt.close()
     
-    # Plot 6: All features side-by-side (2 columns: correlation and distance)
-    fig, axes = plt.subplots(num_features, 2, figsize=(18, 3 * num_features), sharex='col')
-    if num_features == 1:
-        axes = axes.reshape(1, -1)
-    
-    for idx, feature_type in enumerate(FEATURE_TYPES):
-        if feature_type not in results:
-            continue
-        
-        correlations = results[feature_type]['correlation']
-        distances = results[feature_type]['distance']
-        frames = np.arange(1, len(correlations) + 1)
-        
-        # Correlation column
-        axes[idx, 0].plot(frames, correlations, linewidth=1.5, alpha=0.7, color='blue')
-        axes[idx, 0].set_ylabel(f'{feature_type.upper()}\nCorrelation', fontsize=10)
-        axes[idx, 0].grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(correlations):
-                axes[idx, 0].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
-        
-        # Distance column
-        axes[idx, 1].plot(frames, distances, linewidth=1.5, alpha=0.7, color='green')
-        axes[idx, 1].set_ylabel(f'{feature_type.upper()}\nDistance', fontsize=10)
-        axes[idx, 1].grid(True, alpha=0.3)
-        
-        # Add vertical lines for boundaries
-        for boundary in boundaries:
-            if boundary < len(distances):
-                axes[idx, 1].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
-    
-    # Set column titles
-    axes[0, 0].set_title('Correlation', fontsize=12, fontweight='bold', pad=10)
-    axes[0, 1].set_title('Euclidean Distance', fontsize=12, fontweight='bold', pad=10)
-    
-    # Set x-axis labels
-    axes[-1, 0].set_xlabel('Frame Index', fontsize=11)
-    axes[-1, 1].set_xlabel('Frame Index', fontsize=11)
-    
-    fig.suptitle(f'{video_name} - All Features Side-by-Side Comparison', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(video_dir, 'all_features_side_by_side.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"  Saved plots to {video_dir}")
+    print(f"  Saved plots to {output_dir}")
 
 
-def create_combined_plots(all_results: Dict[str, Dict], output_dir: str):
+def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: int, boundaries: List[int],
+                                     results_no_sampling: Dict[str, Dict], 
+                                     results_sampling_8: Dict[str, Dict],
+                                     output_dir: str):
     """
-    Create combined plots showing all videos for each feature type.
+    Create 4-column plots showing all features for both sampling rates.
+    Columns: Correlation (no_sampling), Correlation (sampling_8), Distance (no_sampling), Distance (sampling_8)
+    Creates both smoothed and raw versions.
     
     Args:
-        all_results: Dictionary mapping video_name to results dict
-        output_dir: Directory to save plots
+        video_name: Name of the video
+        video_id: Numeric ID of the video (1-10)
+        frame_count: Total number of frames
+        boundaries: List of boundary frame indices
+        results_no_sampling: Dictionary with results for no_sampling
+        results_sampling_8: Dictionary with results for sampling_8
+        output_dir: Directory to save the plot (video-specific directory)
+    """
+    num_features = len(FEATURE_TYPES)
+    
+    # Create both smoothed and raw versions
+    for version in ['smoothed', 'raw']:
+        fig, axes = plt.subplots(num_features, 4, figsize=(24, 3 * num_features), sharex='col')
+        if num_features == 1:
+            axes = axes.reshape(1, -1)
+        
+        for idx, feature_type in enumerate(FEATURE_TYPES):
+            # Process no_sampling data
+            if feature_type in results_no_sampling:
+                correlations_0 = results_no_sampling[feature_type]['correlation']
+                distances_0 = results_no_sampling[feature_type]['distance']
+                
+                if version == 'smoothed':
+                    correlations_0_plot = apply_smoothing(correlations_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    distances_0_plot = apply_smoothing(distances_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                else:
+                    correlations_0_plot = correlations_0
+                    distances_0_plot = distances_0
+                
+                frames_0 = np.arange(1, len(correlations_0) + 1)
+            else:
+                correlations_0_plot = distances_0_plot = frames_0 = None
+            
+            # Process sampling_8 data
+            if feature_type in results_sampling_8:
+                correlations_8 = results_sampling_8[feature_type]['correlation']
+                distances_8 = results_sampling_8[feature_type]['distance']
+                
+                if version == 'smoothed':
+                    correlations_8_plot = apply_smoothing(correlations_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    distances_8_plot = apply_smoothing(distances_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                else:
+                    correlations_8_plot = correlations_8
+                    distances_8_plot = distances_8
+                
+                frames_8 = np.arange(1, len(correlations_8) + 1)
+            else:
+                correlations_8_plot = distances_8_plot = frames_8 = None
+            
+            # Set colors and alpha based on version
+            if version == 'smoothed':
+                corr_color, dist_color = 'darkblue', 'darkgreen'
+                line_alpha = 0.9
+                linewidth = 2
+            else:
+                corr_color, dist_color = 'blue', 'green'
+                line_alpha = 0.7
+                linewidth = 1.5
+            
+            # Column 0: Correlation (no_sampling)
+            if correlations_0_plot is not None:
+                axes[idx, 0].plot(frames_0, correlations_0_plot, linewidth=linewidth, alpha=line_alpha, color=corr_color)
+                axes[idx, 0].set_ylabel(f'{feature_type.upper()}\nCorrelation', fontsize=10)
+                axes[idx, 0].grid(True, alpha=0.3)
+                for boundary in boundaries:
+                    if boundary < len(correlations_0_plot):
+                        axes[idx, 0].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+            
+            # Column 1: Correlation (sampling_8)
+            if correlations_8_plot is not None:
+                axes[idx, 1].plot(frames_8, correlations_8_plot, linewidth=linewidth, alpha=line_alpha, color=corr_color)
+                axes[idx, 1].set_ylabel(f'{feature_type.upper()}\nCorrelation', fontsize=10)
+                axes[idx, 1].grid(True, alpha=0.3)
+                for boundary in boundaries:
+                    if boundary < len(correlations_8_plot):
+                        axes[idx, 1].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+            
+            # Column 2: Distance (no_sampling)
+            if distances_0_plot is not None:
+                axes[idx, 2].plot(frames_0, distances_0_plot, linewidth=linewidth, alpha=line_alpha, color=dist_color)
+                axes[idx, 2].set_ylabel(f'{feature_type.upper()}\nDistance', fontsize=10)
+                axes[idx, 2].grid(True, alpha=0.3)
+                for boundary in boundaries:
+                    if boundary < len(distances_0_plot):
+                        axes[idx, 2].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+            
+            # Column 3: Distance (sampling_8)
+            if distances_8_plot is not None:
+                axes[idx, 3].plot(frames_8, distances_8_plot, linewidth=linewidth, alpha=line_alpha, color=dist_color)
+                axes[idx, 3].set_ylabel(f'{feature_type.upper()}\nDistance', fontsize=10)
+                axes[idx, 3].grid(True, alpha=0.3)
+                for boundary in boundaries:
+                    if boundary < len(distances_8_plot):
+                        axes[idx, 3].axvline(x=boundary, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        
+        # Set column titles
+        axes[0, 0].set_title('Correlation (Rate 0)', fontsize=12, fontweight='bold', pad=10)
+        axes[0, 1].set_title('Correlation (Rate 8)', fontsize=12, fontweight='bold', pad=10)
+        axes[0, 2].set_title('Distance (Rate 0)', fontsize=12, fontweight='bold', pad=10)
+        axes[0, 3].set_title('Distance (Rate 8)', fontsize=12, fontweight='bold', pad=10)
+        
+        # Set x-axis labels
+        for col in range(4):
+            axes[-1, col].set_xlabel('Frame Index', fontsize=11)
+        
+        version_label = 'Smoothed' if version == 'smoothed' else 'Raw'
+        fig.suptitle(f'Video {video_id} - All Features Comparison ({version_label})', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'all_features_side_by_side_{version}.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    print(f"  Saved 4-column all-features plots (raw and smoothed) to {output_dir}")
+def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], video_id_map: Dict[str, int], output_dir: str):
+    """
+    Create combined plots showing all videos for each feature type.
+    Now creates 4-column plots (correlation rate 0, correlation rate 8, distance rate 0, distance rate 8).
+    Creates both smoothed and raw versions.
+    
+    Args:
+        all_results_by_sampling: Dictionary mapping sampling_key -> video_name -> results dict
+        video_id_map: Dictionary mapping video_name to video_id (1-10)
+        output_dir: Directory to save plots (main output directory)
     """
     print("\nCreating combined plots for all videos...")
+    
+    # Get list of videos (should be same across sampling rates)
+    video_names = list(next(iter(all_results_by_sampling.values())).keys())
     
     for feature_type in FEATURE_TYPES:
         print(f"  Processing {feature_type}...")
         
-        # Correlation plot
-        fig, axes = plt.subplots(len(all_results), 1, figsize=(16, 2.5 * len(all_results)), sharex=False)
-        if len(all_results) == 1:
-            axes = [axes]
-        
-        for idx, (video_name, video_data) in enumerate(all_results.items()):
-            if feature_type not in video_data['results']:
-                continue
+        # Create both smoothed and raw versions
+        for version in ['smoothed', 'raw']:
+            fig = plt.figure(figsize=(28, 2.5 * len(video_names)))
+            gs = fig.add_gridspec(len(video_names), 4, hspace=0.3, wspace=0.3)
             
-            correlations = video_data['results'][feature_type]['correlation']
-            boundaries = video_data['boundaries']
-            frames = np.arange(1, len(correlations) + 1)
+            for idx, video_name in enumerate(video_names):
+                # Get data from both sampling rates
+                video_data_0 = all_results_by_sampling.get('no_sampling', {}).get(video_name, {})
+                video_data_8 = all_results_by_sampling.get('sampling_8', {}).get(video_name, {})
+                
+                boundaries = video_data_0.get('boundaries', video_data_8.get('boundaries', []))
+                
+                # Process no_sampling data
+                if feature_type in video_data_0.get('results', {}):
+                    correlations_0 = video_data_0['results'][feature_type]['correlation']
+                    distances_0 = video_data_0['results'][feature_type]['distance']
+                    
+                    if version == 'smoothed':
+                        correlations_0_plot = apply_smoothing(correlations_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                        distances_0_plot = apply_smoothing(distances_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    else:
+                        correlations_0_plot = correlations_0
+                        distances_0_plot = distances_0
+                    
+                    frames_0 = np.arange(1, len(correlations_0) + 1)
+                else:
+                    correlations_0_plot = distances_0_plot = frames_0 = None
+                
+                # Process sampling_8 data
+                if feature_type in video_data_8.get('results', {}):
+                    correlations_8 = video_data_8['results'][feature_type]['correlation']
+                    distances_8 = video_data_8['results'][feature_type]['distance']
+                    
+                    if version == 'smoothed':
+                        correlations_8_plot = apply_smoothing(correlations_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                        distances_8_plot = apply_smoothing(distances_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    else:
+                        correlations_8_plot = correlations_8
+                        distances_8_plot = distances_8
+                    
+                    frames_8 = np.arange(1, len(correlations_8) + 1)
+                else:
+                    correlations_8_plot = distances_8_plot = frames_8 = None
+                
+                # Set colors and alpha based on version
+                if version == 'smoothed':
+                    corr_color, dist_color = 'darkblue', 'darkgreen'
+                    line_alpha = 0.9
+                    linewidth = 2
+                else:
+                    corr_color, dist_color = 'blue', 'green'
+                    line_alpha = 0.7
+                    linewidth = 1.5
+                
+                # Column 0: Correlation (no_sampling)
+                ax_corr_0 = fig.add_subplot(gs[idx, 0])
+                if correlations_0_plot is not None:
+                    ax_corr_0.plot(frames_0, correlations_0_plot, linewidth=linewidth, alpha=line_alpha, color=corr_color)
+                    for boundary in boundaries:
+                        if boundary < len(correlations_0_plot):
+                            ax_corr_0.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax_corr_0.set_ylabel('Correlation', fontsize=9)
+                if idx == 0:
+                    ax_corr_0.set_title('Correlation (Rate 0)', fontsize=11, fontweight='bold')
+                video_id = video_id_map.get(video_name, idx + 1)
+                ax_corr_0.text(0.02, 0.95, f'Video {video_id}',
+                              transform=ax_corr_0.transAxes, fontsize=8, verticalalignment='top',
+                              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+                ax_corr_0.grid(True, alpha=0.3)
+                
+                # Column 1: Correlation (sampling_8)
+                ax_corr_8 = fig.add_subplot(gs[idx, 1])
+                if correlations_8_plot is not None:
+                    ax_corr_8.plot(frames_8, correlations_8_plot, linewidth=linewidth, alpha=line_alpha, color=corr_color)
+                    for boundary in boundaries:
+                        if boundary < len(correlations_8_plot):
+                            ax_corr_8.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax_corr_8.set_ylabel('Correlation', fontsize=9)
+                if idx == 0:
+                    ax_corr_8.set_title('Correlation (Rate 8)', fontsize=11, fontweight='bold')
+                ax_corr_8.grid(True, alpha=0.3)
+                
+                # Column 2: Distance (no_sampling)
+                ax_dist_0 = fig.add_subplot(gs[idx, 2])
+                if distances_0_plot is not None:
+                    ax_dist_0.plot(frames_0, distances_0_plot, linewidth=linewidth, alpha=line_alpha, color=dist_color)
+                    for boundary in boundaries:
+                        if boundary < len(distances_0_plot):
+                            ax_dist_0.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax_dist_0.set_ylabel('Distance', fontsize=9)
+                if idx == 0:
+                    ax_dist_0.set_title('Distance (Rate 0)', fontsize=11, fontweight='bold')
+                ax_dist_0.grid(True, alpha=0.3)
+                
+                # Column 3: Distance (sampling_8)
+                ax_dist_8 = fig.add_subplot(gs[idx, 3])
+                if distances_8_plot is not None:
+                    ax_dist_8.plot(frames_8, distances_8_plot, linewidth=linewidth, alpha=line_alpha, color=dist_color)
+                    for boundary in boundaries:
+                        if boundary < len(distances_8_plot):
+                            ax_dist_8.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax_dist_8.set_ylabel('Distance', fontsize=9)
+                if idx == 0:
+                    ax_dist_8.set_title('Distance (Rate 8)', fontsize=11, fontweight='bold')
+                ax_dist_8.grid(True, alpha=0.3)
+                
+                # Set x-label only for bottom row
+                if idx == len(video_names) - 1:
+                    ax_corr_0.set_xlabel('Frame Index', fontsize=10)
+                    ax_corr_8.set_xlabel('Frame Index', fontsize=10)
+                    ax_dist_0.set_xlabel('Frame Index', fontsize=10)
+                    ax_dist_8.set_xlabel('Frame Index', fontsize=10)
             
-            axes[idx].plot(frames, correlations, linewidth=1.5, alpha=0.7)
-            axes[idx].set_ylabel('Correlation', fontsize=9)
-            axes[idx].set_title(f'{video_name} ({video_data["frame_count"]} frames, {len(boundaries)} boundaries)', 
-                              fontsize=10, fontweight='bold')
-            axes[idx].grid(True, alpha=0.3)
-            
-            # Add vertical lines for boundaries
-            for boundary in boundaries:
-                if boundary < len(correlations):
-                    axes[idx].axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-        
-        axes[-1].set_xlabel('Frame Index', fontsize=11)
-        fig.suptitle(f'All Videos - {feature_type.upper()} Correlation', fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'all_videos_{feature_type}_correlation.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # Distance plot
-        fig, axes = plt.subplots(len(all_results), 1, figsize=(16, 2.5 * len(all_results)), sharex=False)
-        if len(all_results) == 1:
-            axes = [axes]
-        
-        for idx, (video_name, video_data) in enumerate(all_results.items()):
-            if feature_type not in video_data['results']:
-                continue
-            
-            distances = video_data['results'][feature_type]['distance']
-            boundaries = video_data['boundaries']
-            frames = np.arange(1, len(distances) + 1)
-            
-            axes[idx].plot(frames, distances, linewidth=1.5, alpha=0.7, color='green')
-            axes[idx].set_ylabel('Distance', fontsize=9)
-            axes[idx].set_title(f'{video_name} ({video_data["frame_count"]} frames, {len(boundaries)} boundaries)', 
-                              fontsize=10, fontweight='bold')
-            axes[idx].grid(True, alpha=0.3)
-            
-            # Add vertical lines for boundaries
-            for boundary in boundaries:
-                if boundary < len(distances):
-                    axes[idx].axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-        
-        axes[-1].set_xlabel('Frame Index', fontsize=11)
-        fig.suptitle(f'All Videos - {feature_type.upper()} Euclidean Distance', fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'all_videos_{feature_type}_distance.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # Side-by-side comparison for this feature across all videos
-        fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(20, 2.5 * len(all_results)))
-        
-        # Create subplots for correlation (left) and distance (right)
-        ax_left_subplots = [plt.subplot(len(all_results), 2, i*2 + 1) for i in range(len(all_results))]
-        ax_right_subplots = [plt.subplot(len(all_results), 2, i*2 + 2) for i in range(len(all_results))]
-        plt.close(fig)  # Close the initial figure
-        
-        # Create proper figure with subplots
-        fig = plt.figure(figsize=(20, 2.5 * len(all_results)))
-        gs = fig.add_gridspec(len(all_results), 2, hspace=0.3, wspace=0.3)
-        
-        for idx, (video_name, video_data) in enumerate(all_results.items()):
-            if feature_type not in video_data['results']:
-                continue
-            
-            correlations = video_data['results'][feature_type]['correlation']
-            distances = video_data['results'][feature_type]['distance']
-            boundaries = video_data['boundaries']
-            frames = np.arange(1, len(correlations) + 1)
-            
-            # Correlation subplot (left column)
-            ax_corr = fig.add_subplot(gs[idx, 0])
-            ax_corr.plot(frames, correlations, linewidth=1.5, alpha=0.7, color='blue')
-            ax_corr.set_ylabel('Correlation', fontsize=9)
-            if idx == 0:
-                ax_corr.set_title('Correlation', fontsize=11, fontweight='bold')
-            ax_corr.text(0.02, 0.95, f'{video_name}\n{video_data["frame_count"]} frames, {len(boundaries)} boundaries',
-                        transform=ax_corr.transAxes, fontsize=8, verticalalignment='top',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-            ax_corr.grid(True, alpha=0.3)
-            
-            # Add vertical lines for boundaries
-            for boundary in boundaries:
-                if boundary < len(correlations):
-                    ax_corr.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-            
-            # Distance subplot (right column)
-            ax_dist = fig.add_subplot(gs[idx, 1])
-            ax_dist.plot(frames, distances, linewidth=1.5, alpha=0.7, color='green')
-            ax_dist.set_ylabel('Distance', fontsize=9)
-            if idx == 0:
-                ax_dist.set_title('Euclidean Distance', fontsize=11, fontweight='bold')
-            ax_dist.grid(True, alpha=0.3)
-            
-            # Add vertical lines for boundaries
-            for boundary in boundaries:
-                if boundary < len(distances):
-                    ax_dist.axvline(x=boundary, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-            
-            # Set x-label only for bottom row
-            if idx == len(all_results) - 1:
-                ax_corr.set_xlabel('Frame Index', fontsize=10)
-                ax_dist.set_xlabel('Frame Index', fontsize=10)
-        
-        fig.suptitle(f'All Videos - {feature_type.upper()} Side-by-Side Comparison', fontsize=14, fontweight='bold')
-        plt.savefig(os.path.join(output_dir, f'all_videos_{feature_type}_side_by_side.png'), dpi=150, bbox_inches='tight')
-        plt.close()
+            version_label = 'Smoothed' if version == 'smoothed' else 'Raw'
+            fig.suptitle(f'All Videos - {feature_type.upper()} ({version_label})', fontsize=14, fontweight='bold')
+            plt.savefig(os.path.join(output_dir, f'all_videos_{feature_type}_{version}.png'), dpi=150, bbox_inches='tight')
+            plt.close()
     
     print(f"  Saved combined plots to {output_dir}")
 
@@ -544,116 +619,182 @@ def calculate_statistics(all_results: Dict[str, Dict]) -> Dict:
 
 
 def main():
-    """Main function to analyze features for selected videos."""
+    """Main function to analyze features for selected videos with multiple sampling rates."""
     print("=" * 80)
     print("FEATURE DISTANCE AND CORRELATION ANALYSIS")
     print("=" * 80)
     print(f"\nConfiguration:")
-    print(f"  Features directory: {FEATURES_DIR}")
-    print(f"  Output directory: {OUTPUT_DIR}")
+    print(f"  Smoothing method: {SMOOTHING_METHOD}")
+    print(f"  Smoothing window: {SMOOTHING_WINDOW}")
     print(f"  Feature types: {', '.join(FEATURE_TYPES)}")
+    print(f"  Output directory: {OUTPUT_DIR}")
     
-    # Create output directory
+    # Create main output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Load selected videos
+    # Load selected videos once
     print(f"\nLoading selected videos from selected_videos.json...")
     selected_videos = load_selected_videos()
     print(f"Found {len(selected_videos)} videos to analyze")
     
-    # Process each video
-    all_results = {}
+    # Dictionary to store results by sampling rate
+    all_results_by_sampling = {}
     
-    for video_name, frame_count, transitions, boundaries in selected_videos:
-        print(f"\n{'='*60}")
-        print(f"Processing: {video_name}")
-        print(f"  Frames: {frame_count}, Boundaries: {len(boundaries)}")
-        print(f"  Boundary positions: {boundaries}")
+    # Create video ID mapping (1-10)
+    video_id_map = {video[0]: idx + 1 for idx, video in enumerate(selected_videos)}
+    
+    # Process each sampling rate
+    for sampling_key, features_dir in FEATURES_DIRS.items():
+        print("\n" + "=" * 80)
+        print(f"PROCESSING: {sampling_key.upper().replace('_', ' ')}")
+        print("=" * 80)
+        print(f"  Features directory: {features_dir}")
         
-        results = {}
+        # Process each video
+        all_results = {}
         
-        # Process each feature type
-        for feature_type in FEATURE_TYPES:
-            print(f"\n  Analyzing {feature_type}...")
+        for video_name, frame_count, transitions, boundaries in selected_videos:
+            video_id = video_id_map[video_name]
+            print(f"\n{'='*60}")
+            print(f"Processing: Video {video_id} ({video_name})")
+            print(f"  Frames: {frame_count}, Boundaries: {len(boundaries)}")
+            print(f"  Boundary positions: {boundaries}")
             
-            try:
-                # Load features
-                features = load_feature(FEATURES_DIR, video_name, feature_type)
+            results = {}
+            
+            # Process each feature type
+            for feature_type in FEATURE_TYPES:
+                print(f"\n  Analyzing {feature_type}...")
                 
-                # Calculate correlation and distance
-                correlations = calculate_correlation(features)
-                distances = calculate_euclidean_distance(features)
-                
-                results[feature_type] = {
-                    'correlation': correlations,
-                    'distance': distances
-                }
-                
-                print(f"    Correlation shape: {correlations.shape}")
-                print(f"    Distance shape: {distances.shape}")
-                print(f"    Correlation range: [{correlations.min():.4f}, {correlations.max():.4f}]")
-                print(f"    Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
-                
-            except Exception as e:
-                print(f"    ERROR: {e}")
-                continue
-        
-        # Store results
-        all_results[video_name] = {
-            'frame_count': frame_count,
-            'boundaries': boundaries,
-            'transitions': transitions,
-            'results': results
-        }
-        
-        # Create plots for this video
-        plot_video_analysis(video_name, frame_count, boundaries, results, OUTPUT_DIR)
-    
-    # Create combined plots
-    create_combined_plots(all_results, OUTPUT_DIR)
-    
-    # Calculate and display statistics
-    print("\n" + "=" * 80)
-    print("AGGREGATE STATISTICS ACROSS ALL VIDEOS")
-    print("=" * 80)
-    stats = calculate_statistics(all_results)
-    
-    # Save statistics to JSON
-    stats_file = os.path.join(OUTPUT_DIR, 'statistics.json')
-    with open(stats_file, 'w') as f:
-        json.dump(stats, f, indent=2)
-    print(f"\nStatistics saved to: {stats_file}")
-    
-    # Save results to JSON
-    results_file = os.path.join(OUTPUT_DIR, 'all_results.json')
-    # Convert numpy arrays to lists for JSON serialization
-    json_results = {}
-    for video_name, video_data in all_results.items():
-        json_results[video_name] = {
-            'frame_count': video_data['frame_count'],
-            'boundaries': video_data['boundaries'],
-            'transitions': video_data['transitions'],
-            'results': {}
-        }
-        for feature_type, feature_data in video_data['results'].items():
-            json_results[video_name]['results'][feature_type] = {
-                'correlation': feature_data['correlation'].tolist(),
-                'distance': feature_data['distance'].tolist()
+                try:
+                    # Load features
+                    features = load_feature(features_dir, video_name, feature_type)
+                    
+                    # Calculate correlation and distance
+                    correlations = calculate_correlation(features)
+                    distances = calculate_euclidean_distance(features)
+                    
+                    # Apply smoothing
+                    correlations_smooth = apply_smoothing(correlations, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    distances_smooth = apply_smoothing(distances, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    
+                    results[feature_type] = {
+                        'correlation': correlations,
+                        'distance': distances,
+                        'correlation_smooth': correlations_smooth,
+                        'distance_smooth': distances_smooth
+                    }
+                    
+                    print(f"    Correlation shape: {correlations.shape}")
+                    print(f"    Distance shape: {distances.shape}")
+                    print(f"    Correlation range: [{correlations.min():.4f}, {correlations.max():.4f}]")
+                    print(f"    Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+                    print(f"    Smoothed correlation range: [{correlations_smooth.min():.4f}, {correlations_smooth.max():.4f}]")
+                    print(f"    Smoothed distance range: [{distances_smooth.min():.4f}, {distances_smooth.max():.4f}]")
+                    
+                except Exception as e:
+                    print(f"    ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Store results
+            all_results[video_name] = {
+                'frame_count': frame_count,
+                'boundaries': boundaries,
+                'transitions': transitions,
+                'results': results
             }
+            
+            # Create per-feature plots in sampling-specific subdirectory
+            video_dir = os.path.join(OUTPUT_DIR, str(video_id))
+            sampling_dir = os.path.join(video_dir, sampling_key)
+            plot_video_analysis(video_name, video_id, frame_count, boundaries, results, sampling_dir, sampling_key)
+        
+        # Store results for this sampling rate
+        all_results_by_sampling[sampling_key] = all_results
+        
+        # Calculate and display statistics for this sampling rate
+        print("\n" + "=" * 80)
+        print(f"AGGREGATE STATISTICS - {sampling_key.upper().replace('_', ' ')}")
+        print("=" * 80)
+        stats = calculate_statistics(all_results)
+        
+        # Save statistics to JSON in sampling-specific location
+        stats_file = os.path.join(OUTPUT_DIR, f'statistics_{sampling_key}.json')
+        with open(stats_file, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"\nStatistics saved to: {stats_file}")
+        
+        # Save results to JSON in sampling-specific location
+        results_file = os.path.join(OUTPUT_DIR, f'all_results_{sampling_key}.json')
+        # Convert numpy arrays to lists for JSON serialization
+        json_results = {}
+        for video_name, video_data in all_results.items():
+            json_results[video_name] = {
+                'frame_count': video_data['frame_count'],
+                'boundaries': video_data['boundaries'],
+                'transitions': video_data['transitions'],
+                'results': {}
+            }
+            for feature_type, feature_data in video_data['results'].items():
+                json_results[video_name]['results'][feature_type] = {
+                    'correlation': feature_data['correlation'].tolist(),
+                    'distance': feature_data['distance'].tolist(),
+                    'correlation_smooth': feature_data['correlation_smooth'].tolist(),
+                    'distance_smooth': feature_data['distance_smooth'].tolist()
+                }
+        
+        with open(results_file, 'w') as f:
+            json.dump(json_results, f, indent=2)
+        print(f"Detailed results saved to: {results_file}")
+        
+        print(f"\n✓ Analysis complete for {sampling_key}")
     
-    with open(results_file, 'w') as f:
-        json.dump(json_results, f, indent=2)
-    print(f"Detailed results saved to: {results_file}")
+    # Create 4-column all-features plot for each video
+    print("\n" + "=" * 80)
+    print("CREATING 4-COLUMN ALL-FEATURES PLOTS FOR EACH VIDEO")
+    print("=" * 80)
+    
+    for video_name in selected_videos:
+        video_name_str = video_name[0]
+        video_id = video_id_map[video_name_str]
+        frame_count = video_name[1]
+        boundaries = video_name[3]
+        
+        print(f"\nCreating 4-column plot for Video {video_id} ({video_name_str})...")
+        
+        results_no_sampling = all_results_by_sampling.get('no_sampling', {}).get(video_name_str, {}).get('results', {})
+        results_sampling_8 = all_results_by_sampling.get('sampling_8', {}).get(video_name_str, {}).get('results', {})
+        
+        video_dir = os.path.join(OUTPUT_DIR, str(video_id))
+        os.makedirs(video_dir, exist_ok=True)
+        
+        plot_all_features_side_by_side(video_name_str, video_id, frame_count, boundaries,
+                                       results_no_sampling, results_sampling_8, video_dir)
+    
+    # Create combined 4-column plots in parent directory
+    print("\n" + "=" * 80)
+    print("CREATING COMBINED 4-COLUMN PLOTS IN PARENT DIRECTORY")
+    print("=" * 80)
+    create_combined_plots(all_results_by_sampling, video_id_map, OUTPUT_DIR)
     
     print("\n" + "=" * 80)
-    print("ANALYSIS COMPLETE!")
+    print("ALL ANALYSES COMPLETE!")
     print("=" * 80)
-    print(f"\nResults saved to: {OUTPUT_DIR}/")
-    print(f"  - Individual video plots in subdirectories")
-    print(f"  - Combined plots in main directory")
-    print(f"  - Statistics in statistics.json")
-    print(f"  - Detailed results in all_results.json")
+    print(f"\nResults structure:")
+    print(f"  Main directory: {OUTPUT_DIR}/")
+    print(f"    - Combined 4-column plots for all videos")
+    print(f"    - Statistics and results JSON files for each sampling rate")
+    print(f"  Video directories: {OUTPUT_DIR}/1/ through {OUTPUT_DIR}/10/")
+    print(f"    - 4-column all-features plot")
+    print(f"    - Sampling subdirectories: no_sampling/ and sampling_8/")
+    print(f"      - Individual per-feature plots")
+    print(f"\nVideo ID mapping:")
+    for video_name, video_id in sorted(video_id_map.items(), key=lambda x: x[1]):
+        print(f"  Video {video_id}: {video_name}")
 
 
 if __name__ == "__main__":
     main()
+

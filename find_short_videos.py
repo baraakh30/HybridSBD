@@ -45,17 +45,17 @@ for v in videos_sorted:
 
 print(f'Videos with all features (cnn, hsv, clip, optical_flow): {len(existing)}')
 
-# Filter for videos under 300 frames (10 seconds at 30fps)
-print(f'\nLooking for videos under 300 frames (10 seconds at 30fps):')
-existing_under_300 = [v for v in existing if v[1] <= 300]
-print(f'Videos under 300 frames with boundaries and features: {len(existing_under_300)}')
+# Filter for videos between 600 and 1000 frames (20-33 seconds at 30fps)
+print(f'\nLooking for videos between 600 and 1000 frames:')
+existing_target_range = [v for v in existing if 600 <= v[1] <= 1000]
+print(f'Videos between 500-1000 frames with boundaries and features: {len(existing_target_range)}')
 
-# If not enough, expand to 600 frames
-if len(existing_under_300) < 10:
-    print(f'\nNot enough short videos, expanding to videos under 600 frames (20 seconds):')
-    existing_target = [v for v in existing if v[1] <= 600][:10]
+# If not enough, expand to 300-1500 frames
+if len(existing_target_range) < 10:
+    print(f'\nNot enough videos in 500-1000 range, expanding to 300-1500 frames:')
+    existing_target = [v for v in existing if 300 <= v[1] <= 1500][:10]
 else:
-    existing_target = existing_under_300[:10]
+    existing_target = existing_target_range[:10]
 
 print(f'\nSelected {len(existing_target)} videos:')
 for i, (video_name, frame_count, transitions, boundaries) in enumerate(existing_target, 1):
