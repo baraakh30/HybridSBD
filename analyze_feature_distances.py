@@ -22,8 +22,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Hardcoded configuration from train_transformer.py usage
-VIDEO_DIR = r"C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train"
-GROUND_TRUTH_FILE = r"C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json"
+VIDEO_DIR = r"C:\Users\Baraa\Downloads\ClipShots\videos\train"
+GROUND_TRUTH_FILE = r"C:\Users\Baraa\Downloads\ClipShots\annotations\train.json"
 
 # Feature directories for different sampling rates
 FEATURES_DIRS = {
@@ -278,6 +278,26 @@ def plot_video_analysis(video_name: str, video_id: int, frame_count: int, bounda
     print(f"  Saved plots to {output_dir}")
 
 
+def normalize_signal(signal: np.ndarray) -> np.ndarray:
+    """
+    Normalize a signal to [0, 1] range using min-max normalization.
+    
+    Args:
+        signal: 1D array to normalize
+        
+    Returns:
+        Normalized signal of same shape
+    """
+    min_val = np.min(signal)
+    max_val = np.max(signal)
+    
+    # Avoid division by zero
+    if max_val - min_val < 1e-10:
+        return np.zeros_like(signal)
+    
+    return (signal - min_val) / (max_val - min_val)
+
+
 def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: int, boundaries: List[int],
                                      results_no_sampling: Dict[str, Dict], 
                                      results_sampling_8: Dict[str, Dict],
@@ -285,7 +305,7 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
     """
     Create 4-column plots showing all features for both sampling rates.
     Columns: Correlation (no_sampling), Correlation (sampling_8), Distance (no_sampling), Distance (sampling_8)
-    Creates both smoothed and raw versions.
+    Creates raw, smoothed, normalized, and normalized+smoothed versions.
     
     Args:
         video_name: Name of the video
@@ -298,8 +318,8 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
     """
     num_features = len(FEATURE_TYPES)
     
-    # Create both smoothed and raw versions
-    for version in ['smoothed', 'raw']:
+    # Create four versions: raw, smoothed, normalized, and normalized+smoothed
+    for version in ['smoothed', 'raw', 'normalized', 'normalized_smoothed']:
         fig, axes = plt.subplots(num_features, 4, figsize=(24, 3 * num_features), sharex='col')
         if num_features == 1:
             axes = axes.reshape(1, -1)
@@ -313,6 +333,12 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
                 if version == 'smoothed':
                     correlations_0_plot = apply_smoothing(correlations_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
                     distances_0_plot = apply_smoothing(distances_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                elif version == 'normalized':
+                    correlations_0_plot = normalize_signal(correlations_0)
+                    distances_0_plot = normalize_signal(distances_0)
+                elif version == 'normalized_smoothed':
+                    correlations_0_plot = apply_smoothing(normalize_signal(correlations_0), SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    distances_0_plot = apply_smoothing(normalize_signal(distances_0), SMOOTHING_WINDOW, SMOOTHING_METHOD)
                 else:
                     correlations_0_plot = correlations_0
                     distances_0_plot = distances_0
@@ -329,6 +355,12 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
                 if version == 'smoothed':
                     correlations_8_plot = apply_smoothing(correlations_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
                     distances_8_plot = apply_smoothing(distances_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                elif version == 'normalized':
+                    correlations_8_plot = normalize_signal(correlations_8)
+                    distances_8_plot = normalize_signal(distances_8)
+                elif version == 'normalized_smoothed':
+                    correlations_8_plot = apply_smoothing(normalize_signal(correlations_8), SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    distances_8_plot = apply_smoothing(normalize_signal(distances_8), SMOOTHING_WINDOW, SMOOTHING_METHOD)
                 else:
                     correlations_8_plot = correlations_8
                     distances_8_plot = distances_8
@@ -338,7 +370,7 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
                 correlations_8_plot = distances_8_plot = frames_8 = None
             
             # Set colors and alpha based on version
-            if version == 'smoothed':
+            if version in ['smoothed', 'normalized_smoothed']:
                 corr_color, dist_color = 'darkblue', 'darkgreen'
                 line_alpha = 0.9
                 linewidth = 2
@@ -393,18 +425,27 @@ def plot_all_features_side_by_side(video_name: str, video_id: int, frame_count: 
         for col in range(4):
             axes[-1, col].set_xlabel('Frame Index', fontsize=11)
         
-        version_label = 'Smoothed' if version == 'smoothed' else 'Raw'
+        # Set title based on version
+        if version == 'smoothed':
+            version_label = 'Smoothed'
+        elif version == 'normalized':
+            version_label = 'Normalized'
+        elif version == 'normalized_smoothed':
+            version_label = 'Normalized + Smoothed'
+        else:
+            version_label = 'Raw'
+        
         fig.suptitle(f'Video {video_id} - All Features Comparison ({version_label})', fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, f'all_features_side_by_side_{version}.png'), dpi=150, bbox_inches='tight')
         plt.close()
     
-    print(f"  Saved 4-column all-features plots (raw and smoothed) to {output_dir}")
+    print(f"  Saved 4-column all-features plots (raw, smoothed, normalized, and normalized+smoothed) to {output_dir}")
 def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], video_id_map: Dict[str, int], output_dir: str):
     """
     Create combined plots showing all videos for each feature type.
     Now creates 4-column plots (correlation rate 0, correlation rate 8, distance rate 0, distance rate 8).
-    Creates both smoothed and raw versions.
+    Creates raw, smoothed, normalized, and normalized+smoothed versions.
     
     Args:
         all_results_by_sampling: Dictionary mapping sampling_key -> video_name -> results dict
@@ -419,8 +460,8 @@ def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], v
     for feature_type in FEATURE_TYPES:
         print(f"  Processing {feature_type}...")
         
-        # Create both smoothed and raw versions
-        for version in ['smoothed', 'raw']:
+        # Create four versions: raw, smoothed, normalized, and normalized+smoothed
+        for version in ['smoothed', 'raw', 'normalized', 'normalized_smoothed']:
             fig = plt.figure(figsize=(28, 2.5 * len(video_names)))
             gs = fig.add_gridspec(len(video_names), 4, hspace=0.3, wspace=0.3)
             
@@ -439,6 +480,12 @@ def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], v
                     if version == 'smoothed':
                         correlations_0_plot = apply_smoothing(correlations_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
                         distances_0_plot = apply_smoothing(distances_0, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    elif version == 'normalized':
+                        correlations_0_plot = normalize_signal(correlations_0)
+                        distances_0_plot = normalize_signal(distances_0)
+                    elif version == 'normalized_smoothed':
+                        correlations_0_plot = apply_smoothing(normalize_signal(correlations_0), SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                        distances_0_plot = apply_smoothing(normalize_signal(distances_0), SMOOTHING_WINDOW, SMOOTHING_METHOD)
                     else:
                         correlations_0_plot = correlations_0
                         distances_0_plot = distances_0
@@ -455,6 +502,12 @@ def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], v
                     if version == 'smoothed':
                         correlations_8_plot = apply_smoothing(correlations_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
                         distances_8_plot = apply_smoothing(distances_8, SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                    elif version == 'normalized':
+                        correlations_8_plot = normalize_signal(correlations_8)
+                        distances_8_plot = normalize_signal(distances_8)
+                    elif version == 'normalized_smoothed':
+                        correlations_8_plot = apply_smoothing(normalize_signal(correlations_8), SMOOTHING_WINDOW, SMOOTHING_METHOD)
+                        distances_8_plot = apply_smoothing(normalize_signal(distances_8), SMOOTHING_WINDOW, SMOOTHING_METHOD)
                     else:
                         correlations_8_plot = correlations_8
                         distances_8_plot = distances_8
@@ -464,7 +517,7 @@ def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], v
                     correlations_8_plot = distances_8_plot = frames_8 = None
                 
                 # Set colors and alpha based on version
-                if version == 'smoothed':
+                if version in ['smoothed', 'normalized_smoothed']:
                     corr_color, dist_color = 'darkblue', 'darkgreen'
                     line_alpha = 0.9
                     linewidth = 2
@@ -532,7 +585,16 @@ def create_combined_plots(all_results_by_sampling: Dict[str, Dict[str, Dict]], v
                     ax_dist_0.set_xlabel('Frame Index', fontsize=10)
                     ax_dist_8.set_xlabel('Frame Index', fontsize=10)
             
-            version_label = 'Smoothed' if version == 'smoothed' else 'Raw'
+            # Set title based on version
+            if version == 'smoothed':
+                version_label = 'Smoothed'
+            elif version == 'normalized':
+                version_label = 'Normalized'
+            elif version == 'normalized_smoothed':
+                version_label = 'Normalized + Smoothed'
+            else:
+                version_label = 'Raw'
+            
             fig.suptitle(f'All Videos - {feature_type.upper()} ({version_label})', fontsize=14, fontweight='bold')
             plt.savefig(os.path.join(output_dir, f'all_videos_{feature_type}_{version}.png'), dpi=150, bbox_inches='tight')
             plt.close()

@@ -22,7 +22,7 @@ from core.config import VideoShotConfig, FeatureConfig
 from core.coordinator import ProcessingCoordinator
 
 # Configuration
-VIDEO_DIR = r"C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train"
+VIDEO_DIR = r"C:\Users\Baraa\Downloads\ClipShots\videos\train"
 FEATURES_DIR_NO_SAMPLING = "training_features_no_sampling"
 FEATURES_DIR_SAMPLING_8 = "training_features_sampling_8"
 
