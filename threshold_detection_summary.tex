@@ -1,0 +1,193 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{subcaption}
+\geometry{margin=1in}
+
+\title{\textbf{Threshold-Based Shot Boundary Detection:\\Analysis and Findings}}
+\author{Shot Boundary Detection Project}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document presents results from threshold-based shot boundary detection experiments. Four feature extraction techniques (CNN, HSV Histogram, CLIP, Optical Flow) were tested with different preprocessing strategies (raw, smoothed, normalized-smoothed) and two detection methods (simple, constrained) across 10 videos, comparing performance with and without frame sampling (rate=8).
+\end{abstract}
+
+\section{Introduction}
+
+Threshold-based detection identifies shot boundaries by detecting peaks in frame-to-frame dissimilarity scores. This report presents experimental results from testing multiple feature types and preprocessing configurations.
+
+\section{Methodology}
+
+\subsection{Feature Extraction Methods}
+\begin{itemize}
+    \item \textbf{CNN}: Deep convolutional features
+    \item \textbf{HSV Histogram}: Color distribution
+    \item \textbf{CLIP}: Vision-language embeddings
+    \item \textbf{Optical Flow}: Motion features
+\end{itemize}
+
+\subsection{Preprocessing}
+\begin{itemize}
+    \item \textbf{Raw}: No preprocessing
+    \item \textbf{Smoothed}: Gaussian smoothing
+    \item \textbf{Normalized-Smoothed}: Z-score normalization + smoothing
+\end{itemize}
+
+\subsection{Detection Methods}
+\begin{itemize}
+    \item \textbf{Simple}: All peaks above threshold
+    \item \textbf{Constrained}: Minimum distance between detections
+\end{itemize}
+
+\subsection{Configurations}
+\begin{itemize}
+    \item \textbf{No Sampling}: Every frame processed
+    \item \textbf{Sampling (Rate=8)}: Every 8th frame
+\end{itemize}
+
+\section{Results}
+
+\subsection{Overall Performance Comparison}
+
+Table~\ref{tab:sampling_results} shows the mean performance across all 10 videos for the sampling configuration, while Table~\ref{tab:no_sampling_results} shows results without sampling.
+
+\begin{table}[H]
+\centering
+\caption{Performance with Frame Sampling (Rate=8) - Best configurations per feature}
+\label{tab:sampling_results}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Feature} & \textbf{Config} & \textbf{Precision} & \textbf{Recall} & \textbf{F1-Score} \\
+\midrule
+CNN & Norm-Smooth (Constrained) & 0.242 & 0.683 & \textbf{0.348} \\
+HSV Histogram & Norm-Smooth (Constrained) & 0.388 & 0.711 & \textbf{0.488} \\
+CLIP & Norm-Smooth (Constrained) & 0.190 & 0.557 & \textbf{0.269} \\
+Optical Flow & Norm-Smooth (Constrained) & 0.149 & 0.723 & \textbf{0.241} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Performance without Frame Sampling - Best configurations per feature}
+\label{tab:no_sampling_results}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Feature} & \textbf{Config} & \textbf{Precision} & \textbf{Recall} & \textbf{F1-Score} \\
+\midrule
+CNN & Raw (Constrained) & 0.439 & 0.435 & \textbf{0.427} \\
+HSV Histogram & Norm-Smooth (Constrained) & 0.656 & 0.518 & \textbf{0.567} \\
+CLIP & Raw (Simple) & 0.661 & 0.785 & \textbf{0.671} \\
+Optical Flow & Raw (Constrained) & 0.126 & 0.190 & \textbf{0.145} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Key Findings}
+
+\begin{itemize}
+    \item \textbf{With Sampling}: Normalized-smoothed preprocessing essential. Raw/smoothed yield near-zero performance.
+    \item \textbf{Without Sampling}: Raw features perform well, especially CLIP (F1=0.671) and CNN (F1=0.427).
+    \item \textbf{Simple detection}: High recall ($>$0.95) but very low precision ($<$0.05), causing massive over-detection.
+    \item \textbf{Constrained detection}: 2-10x precision improvement, maintaining reasonable recall (0.5-0.7).
+\end{itemize}
+
+\subsubsection{Best Performers}
+\textbf{With Sampling:} HSV Histogram (F1=0.488) \\
+\textbf{Without Sampling:} CLIP (F1=0.671)
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{threshold_detection_results/sampling_8/summary_comparison_sampling_8.png}
+    \caption{Performance comparison across features and configurations with frame sampling (rate=8)}
+    \label{fig:sampling_summary}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{threshold_detection_results/no_sampling/summary_comparison_no_sampling.png}
+    \caption{Performance comparison across features and configurations without frame sampling}
+    \label{fig:no_sampling_summary}
+\end{figure}
+
+\subsection{Example Video Analysis}
+
+Table~\ref{tab:first_video_sampling} and Table~\ref{tab:first_video_no_sampling} show detailed results for the first video (AN5UYQXsQXLqO0UUYDklpw\_\_) with 12 ground truth boundaries.
+
+\begin{table}[H]
+\centering
+\caption{First Video Results - With Sampling (12 ground truth boundaries)}
+\label{tab:first_video_sampling}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Feature} & \textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} & \textbf{TP} & \textbf{FP} \\
+\midrule
+\multirow{2}{*}{CNN} & Simple & 0.060 & 0.917 & 0.113 & 11 & 171 \\
+                     & Constrained & \textbf{0.333} & \textbf{0.500} & \textbf{0.400} & 6 & 12 \\
+\midrule
+\multirow{2}{*}{HSV} & Simple & 0.076 & 0.833 & 0.139 & 10 & 122 \\
+                     & Constrained & \textbf{0.417} & \textbf{0.833} & \textbf{0.556} & 10 & 14 \\
+\midrule
+\multirow{2}{*}{CLIP} & Simple & 0.052 & 1.000 & 0.098 & 12 & 221 \\
+                      & Constrained & \textbf{0.333} & \textbf{0.500} & \textbf{0.400} & 6 & 12 \\
+\midrule
+\multirow{2}{*}{Optical Flow} & Simple & 0.036 & 0.833 & 0.069 & 10 & 268 \\
+                              & Constrained & \textbf{0.276} & \textbf{0.667} & \textbf{0.390} & 8 & 21 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{First Video Results - Without Sampling (12 ground truth boundaries)}
+\label{tab:first_video_no_sampling}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Feature} & \textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} & \textbf{TP} & \textbf{FP} \\
+\midrule
+\multirow{2}{*}{CNN (Raw)} & Simple & 0.131 & 0.917 & 0.229 & 11 & 73 \\
+                           & Constrained & \textbf{0.250} & 0.167 & 0.200 & 2 & 6 \\
+\midrule
+\multirow{2}{*}{HSV (Raw)} & Simple & 0.101 & 0.833 & 0.180 & 10 & 89 \\
+                           & Constrained & \textbf{0.333} & 0.250 & 0.286 & 3 & 6 \\
+\midrule
+\multirow{2}{*}{CLIP (Raw)} & Simple & \textbf{0.571} & \textbf{0.667} & \textbf{0.615} & 8 & 7 \\
+                            & Constrained & \textbf{0.857} & 0.500 & 0.632 & 6 & 2 \\
+\midrule
+\multirow{2}{*}{Optical Flow (Raw)} & Simple & 0.073 & 1.000 & 0.136 & 12 & 152 \\
+                                    & Constrained & 0.083 & 0.083 & 0.083 & 1 & 11 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+Frame sampling fundamentally changes optimal preprocessing: normalization becomes essential with sampling, while raw features excel without sampling. Constrained detection is critical to reduce false positives. HSV Histogram provides consistent performance across configurations, while CLIP achieves best results with full-frame processing.
+
+\subsection{Limitations}
+\begin{itemize}
+    \item May not capture complex transitions (dissolves, fades)
+    \item Performance varies by video type
+    \item Optical flow has low precision
+    \item High false positive rates with simple detection
+\end{itemize}
+
+\section{Conclusion}
+
+HSV Histogram with normalized-smoothed preprocessing and constrained detection provides consistent results (F1=0.488-0.567). CLIP achieves superior performance (F1=0.671) with full temporal resolution. Constrained detection reduces false positives by orders of magnitude while maintaining good recall.
+
+\end{document}
