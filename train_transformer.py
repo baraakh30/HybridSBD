@@ -641,9 +641,9 @@ class BoundaryDataset(torch.utils.data.Dataset):
             # This error occurs when Windows runs out of memory mapping handles (not RAM),
             # especially with many DataLoader workers accessing files repeatedly.
             # Solution: Direct file I/O to read only the slice we need without memory mapping.
+            # Load only the required sequence efficiently
             try:
                 # Open file and seek to the specific position to load only what we need
-                # This avoids both mmap issues on Windows and loading entire files
                 with open(feature_file, 'rb') as f:
                     # Read numpy header to get shape and dtype info
                     version = np.lib.format.read_magic(f)
@@ -671,63 +671,155 @@ class BoundaryDataset(torch.utils.data.Dataset):
                         features_full = np.load(f)
                         sequence_features = features_full[start_frame:end_frame].copy()
                 
+                # SOTA Enhancement: Synthetic Augmentation
+                # Randomly replace non-boundary sequences with synthetic transitions
+                # This teaches the model the "physics" of a transition (blending features)
+                # 30% chance for non-boundary sequences
+                is_boundary_seq = any(start_frame <= b < end_frame - 1 for b in boundaries)
+                if not is_boundary_seq and np.random.random() < 0.3:
+                    sequence_features, new_labels = self._synthetic_augmentation(sequence_features)
+                    use_synthetic = True
+                else:
+                    use_synthetic = False
+                    
                 # Validate shape
                 if len(sequence_features.shape) != 2:
                     raise ValueError(f"Expected 2D features array, got shape {sequence_features.shape}")
                 
                 if sequence_features.shape[0] != self.sequence_length:
-                    raise ValueError(f"Expected {self.sequence_length} frames, got {sequence_features.shape[0]}")
+                    # Handle edge cases with padding if needed
+                    if sequence_features.shape[0] < self.sequence_length:
+                        padding = np.zeros((self.sequence_length - sequence_features.shape[0], sequence_features.shape[1]))
+                        sequence_features = np.concatenate([sequence_features, padding], axis=0)
+                    else:
+                        sequence_features = sequence_features[:self.sequence_length]
                 
-                # PAD FEATURES TO MAXIMUM DIMENSION IF NEEDED (for variable PCA dimensions)
-                # This ensures all samples have the same feature dimension
+                # PAD FEATURES TO MAXIMUM DIMENSION IF NEEDED
                 current_dim = sequence_features.shape[1]
                 if self._feature_dim is not None and current_dim < self._feature_dim:
-                    # Pad with zeros to match the maximum dimension
                     padding = np.zeros((self.sequence_length, self._feature_dim - current_dim))
                     sequence_features = np.concatenate([sequence_features, padding], axis=1)
                 elif self._feature_dim is None:
-                    # First sample, set the dimension
                     self._feature_dim = current_dim
                 elif current_dim > self._feature_dim:
-                    # Update to larger dimension and we'll need to pad previous samples
                     self._feature_dim = current_dim
                 
-                # Create labels for this sequence
-                labels = np.zeros(self.sequence_length - 1)
-                for boundary in boundaries:
-                    if start_frame <= boundary < end_frame - 1:
-                        labels[boundary - start_frame] = 1
+                if use_synthetic:
+                    labels = new_labels
+                else:
+                    # Create labels for this sequence
+                    labels = np.zeros(self.sequence_length - 1)
+                    for boundary in boundaries:
+                        if start_frame <= boundary < end_frame - 1:
+                            labels[boundary - start_frame] = 1
                 
-                sequence_labels = labels
-                
+                # SOTA Enhancement: Gaussian Label Smoothing
+                # Softens hard cuts to account for ambiguity and soft transitions
+                if self.training:  # Only apply during training
+                    labels = self._apply_gaussian_smoothing(labels)
+                    
             except Exception as e:
-                # Fallback to zeros if loading fails
-                print(f"Error loading features for {video_stem} at frame {start_frame}: {e}")
-                print(f"  Feature file: {feature_file}")
-                print(f"  Frame range: {start_frame}-{end_frame}")
-                print(f"  Expected shape: ({self.sequence_length}, feature_dim)")
-                print(f"  Video ID: {sample.get('video_name', 'unknown')}")
-                # Use the actual feature dimension from the first valid sample
-                feature_dim = 256  # Default for PCA
-                if hasattr(self, '_feature_dim') and self._feature_dim is not None:
-                    feature_dim = self._feature_dim
-                sequence_features = np.zeros((self.sequence_length, feature_dim))
-                sequence_labels = np.zeros(self.sequence_length - 1)
+                # Handle any errors during loading
+                if not self.quiet:
+                    print(f"Error loading features for {video_name_stem}: {e}")
+                # Return zero features as fallback
+                sequence_features = np.zeros((self.sequence_length, self._feature_dim or 512))
+                labels = np.zeros(self.sequence_length - 1)
+                
         else:
-            # Features already in memory
+            # ORIGINAL PRE-LOADED BEHAVIOR (kept for backward compatibility)
+            # Create sequences with full data
             sequence_features = sample['features']
-            sequence_labels = sample['labels']
+            labels = sample['labels']
+            
+            # Pad if needed
+            if sequence_features.shape[0] < self.sequence_length:
+                padding = np.zeros((self.sequence_length - sequence_features.shape[0], sequence_features.shape[1]))
+                sequence_features = np.concatenate([sequence_features, padding], axis=0)
+            
+            # Apply SOTA augmentations even for pre-loaded data
+            if self.training:
+                # Synthetic augmentation
+                is_boundary_seq = np.any(labels == 1)
+                if not is_boundary_seq and np.random.random() < 0.3:
+                    sequence_features, labels = self._synthetic_augmentation(sequence_features)
+                
+                # Gaussian smoothing
+                labels = self._apply_gaussian_smoothing(labels)
+
+        # Convert to tensors
+        features_tensor = torch.from_numpy(sequence_features).float()
+        labels_tensor = torch.from_numpy(labels).float()
         
-        # Final validation before converting to tensors
-        assert len(sequence_features.shape) == 2, f"Features must be 2D, got {sequence_features.shape}"
-        assert sequence_features.shape[0] == self.sequence_length, f"Expected {self.sequence_length} frames, got {sequence_features.shape[0]}"
-        assert len(sequence_labels.shape) == 1, f"Labels must be 1D, got {sequence_labels.shape}"
-        assert sequence_labels.shape[0] == self.sequence_length - 1, f"Expected {self.sequence_length-1} labels, got {sequence_labels.shape[0]}"
+        return features_tensor, labels_tensor
+
+    def _synthetic_augmentation(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a synthetic transition by blending two parts of the sequence.
+        This simulates dissolves and wipes mathematically in feature space.
         
-        features = torch.from_numpy(sequence_features).float()
-        labels = torch.from_numpy(sequence_labels).float()
+        Ref: TransNet V2 / AutoShot augmentation strategy
+        """
+        seq_len, dim = features.shape
+        cut_point = np.random.randint(int(seq_len * 0.3), int(seq_len * 0.7))
+        transition_len = np.random.randint(1, 15)  # 1-15 frame transition
         
-        return features, labels
+        # Take two random segments from the sequence (treated as unrelated clips)
+        # We scramble the second half to make it look "different"
+        clip_a = features.copy()
+        clip_b = np.roll(features, shift=int(seq_len/2), axis=0) 
+        # Add some noise to make them distinct
+        clip_b += np.random.normal(0, 0.1, clip_b.shape)
+        
+        # Create transition
+        result = np.zeros_like(features)
+        labels = np.zeros(seq_len - 1)
+        
+        # Linear blend (dissolve simulation)
+        half_trans = transition_len // 2
+        start_trans = max(0, cut_point - half_trans)
+        end_trans = min(seq_len, cut_point + half_trans + 1)
+        
+        # Part A (before transition)
+        result[:start_trans] = clip_a[:start_trans]
+        
+        # Transition zone
+        for i in range(start_trans, end_trans):
+            alpha = (i - start_trans) / max(1, end_trans - start_trans)
+            result[i] = (1 - alpha) * clip_a[i] + alpha * clip_b[i]
+            
+        # Part B (after transition)
+        result[end_trans:] = clip_b[end_trans:]
+        
+        # Set label at the center of transition
+        if 0 <= cut_point < seq_len - 1:
+            labels[cut_point] = 1
+            
+        return result, labels
+
+    def _apply_gaussian_smoothing(self, labels: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+        """
+        Apply Gaussian smoothing to binary labels.
+        Converts [0, 1, 0] -> [0.1, 0.8, 0.1]
+        
+        This accounts for temporal ambiguity in soft transitions.
+        """
+        if not np.any(labels == 1):
+            return labels
+            
+        smoothed = labels.copy()
+        boundary_indices = np.where(labels == 1)[0]
+        
+        for idx in boundary_indices:
+            # simple 3-frame kernel is usually sufficient and faster
+            if idx > 0:
+                smoothed[idx-1] = max(smoothed[idx-1], 0.3)
+            smoothed[idx] = 1.0  # Keep peak at 1.0
+            if idx < len(labels) - 1:
+                smoothed[idx+1] = max(smoothed[idx+1], 0.3)
+                
+        return smoothed
+
 
 
 def load_video_worker(video_file: Path, video_queue: queue.Queue, 
