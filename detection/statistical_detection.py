@@ -27,7 +27,8 @@ class StatisticalDetection(BaseDetectionMethod):
             config: Configuration dictionary containing:
                 - smoothing_method: 'gaussian' or 'savgol'
                 - smoothing_window: Window size for smoothing
-                - z_score_window: Window size for z-score normalization
+                - normalization_type: 'none', 'minmax', 'zscore', 'rolling_zscore', 'robust'
+                - z_score_window: Window size for rolling z-score normalization
                 - short_scale, medium_scale, long_scale: Multi-scale windows
                 - threshold_method: 'fixed', 'adaptive', 'percentile'
                 - fixed_threshold: Fixed threshold value
@@ -42,6 +43,7 @@ class StatisticalDetection(BaseDetectionMethod):
         self.smoothing_window = config.get("smoothing_window", 5)
         
         # Normalization parameters
+        self.normalization_type = config.get("normalization_type", "rolling_zscore")
         self.z_score_window = config.get("z_score_window", 30)
         
         # Multi-scale analysis
@@ -115,10 +117,59 @@ class StatisticalDetection(BaseDetectionMethod):
         else:
             smoothed = signal.copy()
         
-        # Rolling z-score normalization
-        normalized = self._rolling_z_score(smoothed, self.z_score_window)
+        # Apply normalization based on type
+        normalized = self._normalize_signal(smoothed)
         
         return normalized
+    
+    def _normalize_signal(self, signal: np.ndarray) -> np.ndarray:
+        """
+        Normalize signal based on configured normalization type.
+        
+        Args:
+            signal: Input signal (after smoothing)
+            
+        Returns:
+            Normalized signal
+        """
+        if self.normalization_type == "none":
+            # No normalization - use raw signal
+            return signal.copy()
+        
+        elif self.normalization_type == "minmax":
+            # Min-max normalization to [0, 1]
+            min_val = np.min(signal)
+            max_val = np.max(signal)
+            if max_val - min_val > 1e-8:
+                return (signal - min_val) / (max_val - min_val)
+            else:
+                return np.zeros_like(signal)
+        
+        elif self.normalization_type == "zscore":
+            # Global z-score normalization
+            mean = np.mean(signal)
+            std = np.std(signal)
+            if std > 1e-8:
+                return (signal - mean) / std
+            else:
+                return np.zeros_like(signal)
+        
+        elif self.normalization_type == "rolling_zscore":
+            # Rolling z-score (original behavior)
+            return self._rolling_z_score(signal, self.z_score_window)
+        
+        elif self.normalization_type == "robust":
+            # Robust normalization using median and IQR
+            median = np.median(signal)
+            q75, q25 = np.percentile(signal, [75, 25])
+            iqr = q75 - q25
+            if iqr > 1e-8:
+                return (signal - median) / iqr
+            else:
+                return np.zeros_like(signal)
+        
+        else:
+            raise ValueError(f"Unknown normalization type: {self.normalization_type}")
     
     def _rolling_z_score(self, signal: np.ndarray, window: int) -> np.ndarray:
         """

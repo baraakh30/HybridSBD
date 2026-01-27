@@ -122,8 +122,10 @@ class CrossTransformerFusion(BaseFusionStrategy):
             # Final projection
             output = self.output_projection(fused_features)
             
-            # Normalize
-            output = F.normalize(output, p=2, dim=1)
+            # NOTE: L2 normalization REMOVED to preserve magnitude information
+            # The boundary detector relies on frame-to-frame magnitude differences
+            # Normalizing destroys this signal and causes F1 to drop to ~0.07
+            # output = F.normalize(output, p=2, dim=1)  # DISABLED
             
             return output.cpu().numpy()
     

@@ -90,11 +90,11 @@ class DetectionConfig:
     # Training parameters
     batch_size: int = 32
     learning_rate: float = 1e-4
-    num_epochs: int = 20
+    num_epochs: int = 50
     early_stopping_patience: int = 10
     
     # Loss function configuration
-    loss_type: str = "bce"  # "focal" or "bce" - USE BCE for now, it's simpler and more stable
+    loss_type: str = "combo_v2"  # "focal" or "bce" - USE BCE for now, it's simpler and more stable
     focal_alpha: float = 0.25  # For focal loss: balanced (if you switch back to focal)
     focal_gamma: float = 2.0   # For focal loss: focusing parameter
     # class_weights: Dict[str, float] = field(default_factory=lambda: {"negative": 1.0, "positive": 30.0})  # Balanced weight for 1:85 imbalance
@@ -111,7 +111,7 @@ class ProcessingConfig:
     temporal_tolerance: int = 5
     
     # Performance settings
-    batch_size: int = 16
+    batch_size: int = 32
     num_workers: int = 4
     device: str = "auto"  # auto, cpu, cuda, mps
     

@@ -16,6 +16,14 @@ import logging
 import time
 from pathlib import Path
 
+# Try to import decord for faster video loading
+try:
+    from decord import VideoReader, cpu
+    DECORD_AVAILABLE = True
+except ImportError:
+    DECORD_AVAILABLE = False
+    logging.info("Decord not available, falling back to OpenCV for video loading. Install with: pip install decord")
+
 
 class VideoProcessor:
     """
@@ -33,18 +41,21 @@ class VideoProcessor:
         self.frame_rate = config.frame_rate
         
     def load_video(self, video_path: str, max_frames: Optional[int] = None, 
-                  max_retries: int = 3, skip_corrupted: bool = True) -> np.ndarray:
+                  max_retries: int = 3, skip_corrupted: bool = True,
+                  use_decord: bool = True) -> np.ndarray:
         """
         Load video frames from file with robust error handling.
+        Uses decord for faster loading if available, falls back to OpenCV.
         
         Args:
             video_path: Path to video file
             max_frames: Maximum number of frames to load
             max_retries: Maximum number of retry attempts for corrupted videos
             skip_corrupted: Whether to skip corrupted frames instead of failing
+            use_decord: Whether to try decord first (faster, 2-3x speedup)
             
         Returns:
-            Array of frames with shape (N, H, W, C)
+            Array of frames with shape (N, H, W, C) in RGB format
             
         Raises:
             FileNotFoundError: If video file doesn't exist
@@ -53,11 +64,63 @@ class VideoProcessor:
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
         
-        # Ensure OpenCV environment variables are properly set (should be set at module level, but verify)
-        os.environ.setdefault('OPENCV_FFMPEG_READ_ATTEMPTS', '16384')  # Increase read attempts
-        os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')  # Reduce verbose warnings
-        os.environ.setdefault('OPENCV_FFMPEG_DEMUXER_OPTIONS', 'analyzeduration;10000000;probesize;50000000')  # Better stream analysis
-        os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'video_stream_id;0')  # Force video stream only
+        # Try decord first (faster)
+        if use_decord and DECORD_AVAILABLE:
+            try:
+                return self._load_video_decord(video_path, max_frames)
+            except Exception as e:
+                logging.warning(f"Decord failed for {video_path}: {e}. Falling back to OpenCV.")
+        
+        # Fallback to OpenCV
+        return self._load_video_opencv(video_path, max_frames, max_retries, skip_corrupted)
+    
+    def _load_video_decord(self, video_path: str, max_frames: Optional[int] = None) -> np.ndarray:
+        """
+        Load video using decord (fast, optimized for ML).
+        
+        Args:
+            video_path: Path to video file
+            max_frames: Maximum number of frames to load
+            
+        Returns:
+            Array of frames with shape (N, H, W, C) in RGB format
+        """
+        # Use multiple threads for faster decoding
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=4)
+        
+        total_frames = len(vr)
+        if total_frames == 0:
+            raise RuntimeError(f"No frames found in video: {video_path}")
+        
+        # Determine frame indices to load
+        if max_frames and max_frames < total_frames:
+            frame_indices = list(range(max_frames))
+        else:
+            frame_indices = list(range(total_frames))
+        
+        # Batch load all frames at once (much faster than sequential)
+        frames = vr.get_batch(frame_indices).asnumpy()  # Returns RGB format
+        
+        # Resize if needed
+        if self.target_size and frames.shape[1:3] != self.target_size[::-1]:
+            resized_frames = []
+            for frame in frames:
+                resized = cv2.resize(frame, self.target_size)
+                resized_frames.append(resized)
+            frames = np.array(resized_frames)
+        
+        return frames
+    
+    def _load_video_opencv(self, video_path: str, max_frames: Optional[int] = None,
+                          max_retries: int = 3, skip_corrupted: bool = True) -> np.ndarray:
+        """
+        Load video using OpenCV (fallback method).
+        """
+        # Ensure OpenCV environment variables are properly set
+        os.environ.setdefault('OPENCV_FFMPEG_READ_ATTEMPTS', '16384')
+        os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')
+        os.environ.setdefault('OPENCV_FFMPEG_DEMUXER_OPTIONS', 'analyzeduration;10000000;probesize;50000000')
+        os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'video_stream_id;0')
         
         for attempt in range(max_retries):
             try:
@@ -65,7 +128,7 @@ class VideoProcessor:
             except Exception as e:
                 if attempt < max_retries - 1:
                     logging.warning(f"Video loading attempt {attempt + 1} failed for {video_path}: {e}. Retrying...")
-                    time.sleep(0.5)  # Brief pause before retry
+                    time.sleep(0.5)
                 else:
                     raise RuntimeError(f"Failed to load video {video_path} after {max_retries} attempts: {e}")
     

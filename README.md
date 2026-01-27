@@ -304,23 +304,23 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - PyTorch team for the deep learning framework
 - Research communities for dataset contributions
 
-train_transformer.py --video_dir "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"
+train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"
 
 
-C:/Users/Baraa/anaconda3/envs/unsloth_env/python.exe d:/grad/video_shot_detection/main_test.py --video_path "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train\3505586409.mp4" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --method statistical --tolerance 10
+C:/Users/Baraa/anaconda3/envs/unsloth_env/python.exe d:/grad/video_shot_detection/main_test.py --video_path "C:\Users\Baraa\Documents\ClipShots\videos\train\3505586409.mp4" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --method statistical --tolerance 10
 
-train_transformer.py --video_dir "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --train_all_strategies
+train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --train_all_strategies
 
-train_transformer.py --video_dir "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"  --max_workers 10 --parallel_features
+train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"  --max_workers 10 --parallel_features
 
-train_transformer.py --video_dir "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --max_workers 10 --parallel_features
-
-
-
-
-python interactive_visualizer.py --video "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\videos\train\4001498009.mp4" --results "test_results_single\test_results.json" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json"
+train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --max_workers 10 --parallel_features
 
 
 
 
-"C:/Users/Abdalrahman Khanfar/Documents/grad/.venv/Scripts/python.exe" test_sequence_model.py --model_path "C:\Users\Abdalrahman Khanfar\Documents\grad\models\111.pth" --features_dir "training_features" --ground_truth "C:\Users\Abdalrahman Khanfar\Documents\ClipShots\annotations\train.json" --output_dir "test_results_single" --num_videos 300 --visualize --sequence_threshold 0.6 --boundary_selection max_diff
+python interactive_visualizer.py --video "C:\Users\Baraa\Documents\ClipShots\videos\train\4001498009.mp4" --results "test_results_single\test_results.json" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json"
+
+
+
+
+"C:/Users/Abdalrahman Khanfar/Documents/grad/.venv/Scripts/python.exe" test_sequence_model.py --model_path "C:\Users\Baraa\Documents\grad\models\111.pth" --features_dir "training_features" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --output_dir "test_results_single" --num_videos 300 --visualize --sequence_threshold 0.6 --boundary_selection max_diff

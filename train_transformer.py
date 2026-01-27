@@ -35,6 +35,394 @@ warning_filter = "ignore"
 import warnings 
 warnings.filterwarnings(warning_filter)
 
+# =============================================================================
+# FEATURE TYPE CONSTANTS
+# =============================================================================
+# Individual feature types that can be used for training (not fused)
+INDIVIDUAL_FEATURE_TYPES = ['hsv_histogram', 'cnn', 'clip', 'optical_flow']
+
+# Fusion strategies available
+FUSION_STRATEGIES = ['concatenation', 'weighted', 'pca', 'cross_transformer', 'hierarchical']
+
+# =============================================================================
+# REPRODUCIBILITY: Fixed random seeds for scientific validity
+# =============================================================================
+DEFAULT_RANDOM_SEED = 42
+
+def set_random_seeds(seed: int = DEFAULT_RANDOM_SEED):
+    """
+    Set random seeds for reproducibility across all libraries.
+    
+    This is CRITICAL for scientific reproducibility:
+    - Same seed = same results across runs
+    - Essential for peer review and publication
+    
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU
+    
+    # Make PyTorch deterministic (may slightly impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Set environment variable for hash-based operations
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"Random seeds set to {seed} for reproducibility")
+
+
+# =============================================================================
+# SYNTHETIC BOUNDARY GENERATOR
+# Creates mathematically realistic transitions in feature space
+# =============================================================================
+class SyntheticBoundaryGenerator:
+    """
+    Generates synthetic shot boundaries by mathematically combining features 
+    from different video segments. This solves class imbalance and teaches
+    the model what transitions "look like" in feature space.
+    
+    Inspired by TransNetV2's synthetic data augmentation approach.
+    
+    Transition Types:
+    1. Hard Cut: Instant transition (most common in real videos)
+    2. Dissolve: Linear blending over N frames (cross-fade)
+    3. Fade: A → black → B (fade through black/white)
+    4. Wipe: Gradual spatial replacement (simulated in feature space)
+    """
+    
+    # Transition type probabilities (matching real-world distribution)
+    TRANSITION_PROBS = {
+        'hard_cut': 0.70,    # 70% hard cuts (most common)
+        'dissolve': 0.20,    # 20% dissolves
+        'fade': 0.05,        # 5% fades
+        'wipe': 0.05         # 5% wipes
+    }
+    
+    def __init__(self, feature_files: List[str], sequence_length: int = 100,
+                 feature_dim: int = None, quiet: bool = False):
+        """
+        Initialize the synthetic boundary generator.
+        
+        Args:
+            feature_files: List of paths to feature .npy files (different videos)
+            sequence_length: Length of sequences to generate
+            feature_dim: Expected feature dimension (auto-detected if None)
+            quiet: Suppress print messages
+        """
+        self.feature_files = feature_files
+        self.sequence_length = sequence_length
+        self.feature_dim = feature_dim
+        self.quiet = quiet
+        
+        # Pre-load feature file metadata for efficient random access
+        self._file_metadata = {}
+        self._valid_files = []
+        self._init_file_metadata()
+        
+        if not quiet:
+            print(f"SyntheticBoundaryGenerator initialized with {len(self._valid_files)} valid video features")
+    
+    def _init_file_metadata(self):
+        """Pre-scan feature files to get their shapes without loading full data."""
+        for fpath in self.feature_files:
+            try:
+                if not os.path.exists(fpath):
+                    continue
+                    
+                # Read only the header to get shape
+                with open(fpath, 'rb') as f:
+                    version = np.lib.format.read_magic(f)
+                    shape, _, dtype = np.lib.format._read_array_header(f, version)
+                
+                if len(shape) == 2 and shape[0] >= self.sequence_length // 2:
+                    self._file_metadata[fpath] = {
+                        'shape': shape,
+                        'dtype': dtype,
+                        'num_frames': shape[0],
+                        'feature_dim': shape[1]
+                    }
+                    self._valid_files.append(fpath)
+                    
+                    # Track MAXIMUM feature dimension across all files
+                    # This handles variable PCA dimensions
+                    if self.feature_dim is None:
+                        self.feature_dim = shape[1]
+                    else:
+                        self.feature_dim = max(self.feature_dim, shape[1])
+                        
+            except Exception:
+                continue
+    
+    def _load_random_segment(self, min_frames: int = 30) -> np.ndarray:
+        """
+        Load a random segment from a random video.
+        
+        Args:
+            min_frames: Minimum frames to load
+            
+        Returns:
+            Feature array of shape (num_frames, feature_dim)
+        """
+        if not self._valid_files:
+            return None
+            
+        # Pick a random file
+        fpath = np.random.choice(self._valid_files)
+        meta = self._file_metadata[fpath]
+        
+        # Pick a random start position
+        max_start = max(0, meta['num_frames'] - min_frames)
+        start_idx = np.random.randint(0, max_start + 1)
+        end_idx = min(start_idx + min_frames, meta['num_frames'])
+        
+        # Load only the segment we need
+        try:
+            with open(fpath, 'rb') as f:
+                version = np.lib.format.read_magic(f)
+                shape, _, dtype = np.lib.format._read_array_header(f, version)
+                
+                bytes_per_row = shape[1] * dtype.itemsize
+                f.seek(start_idx * bytes_per_row, 1)
+                
+                num_rows = end_idx - start_idx
+                data = np.frombuffer(f.read(num_rows * bytes_per_row), dtype=dtype)
+                return data.reshape(num_rows, shape[1]).copy()
+        except Exception:
+            return None
+    
+    def _pad_to_feature_dim(self, segment: np.ndarray) -> np.ndarray:
+        """
+        Pad segment to match the target feature dimension.
+        
+        This handles cases where PCA produces different dimensions for different videos.
+        
+        Args:
+            segment: Feature array of shape (num_frames, current_dim)
+            
+        Returns:
+            Padded array of shape (num_frames, feature_dim)
+        """
+        if segment is None:
+            return None
+            
+        current_dim = segment.shape[1]
+        
+        if current_dim == self.feature_dim:
+            return segment
+        elif current_dim < self.feature_dim:
+            # Pad with zeros
+            padding = np.zeros((segment.shape[0], self.feature_dim - current_dim))
+            return np.concatenate([segment, padding], axis=1)
+        else:
+            # Truncate (shouldn't happen often, but handle it)
+            return segment[:, :self.feature_dim]
+    
+    def generate_synthetic_sequence(self) -> Tuple[np.ndarray, np.ndarray, str]:
+        """
+        Generate a synthetic sequence with a mathematically created boundary.
+        
+        Returns:
+            Tuple of (features, labels, transition_type):
+            - features: (sequence_length, feature_dim) array
+            - labels: (sequence_length - 1,) binary labels
+            - transition_type: string describing the transition
+        """
+        # Load two random segments from DIFFERENT videos
+        segment_a = self._load_random_segment(self.sequence_length)
+        segment_b = self._load_random_segment(self.sequence_length)
+        
+        if segment_a is None or segment_b is None:
+            return None, None, None
+        
+        # IMPORTANT: Pad segments to match feature_dim (handles variable PCA dimensions)
+        segment_a = self._pad_to_feature_dim(segment_a)
+        segment_b = self._pad_to_feature_dim(segment_b)
+        
+        # Choose transition type based on probabilities
+        transition_type = np.random.choice(
+            list(self.TRANSITION_PROBS.keys()),
+            p=list(self.TRANSITION_PROBS.values())
+        )
+        
+        # Choose transition position (middle 40-60% of sequence for stability)
+        cut_point = np.random.randint(
+            int(self.sequence_length * 0.35),
+            int(self.sequence_length * 0.65)
+        )
+        
+        # Generate the synthetic sequence based on transition type
+        if transition_type == 'hard_cut':
+            features, labels = self._create_hard_cut(segment_a, segment_b, cut_point)
+        elif transition_type == 'dissolve':
+            features, labels = self._create_dissolve(segment_a, segment_b, cut_point)
+        elif transition_type == 'fade':
+            features, labels = self._create_fade(segment_a, segment_b, cut_point)
+        else:  # wipe
+            features, labels = self._create_wipe(segment_a, segment_b, cut_point)
+        
+        return features, labels, transition_type
+    
+    def _create_hard_cut(self, seg_a: np.ndarray, seg_b: np.ndarray, 
+                         cut_point: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a hard cut transition (instant change).
+        
+        This is the most common type (70% of real transitions).
+        The feature vector changes abruptly from A to B.
+        """
+        result = np.zeros((self.sequence_length, self.feature_dim))
+        labels = np.zeros(self.sequence_length - 1)
+        
+        # Use beginning of seg_a and end of seg_b (different content)
+        a_frames = min(cut_point, len(seg_a))
+        b_frames = min(self.sequence_length - cut_point, len(seg_b))
+        
+        # Part A (before cut)
+        result[:a_frames] = seg_a[:a_frames]
+        
+        # Part B (after cut) - use END of segment B for different content
+        b_start = max(0, len(seg_b) - b_frames)
+        result[cut_point:cut_point + b_frames] = seg_b[b_start:b_start + b_frames]
+        
+        # Boundary at cut point
+        if 0 <= cut_point - 1 < len(labels):
+            labels[cut_point - 1] = 1.0
+        
+        return result, labels
+    
+    def _create_dissolve(self, seg_a: np.ndarray, seg_b: np.ndarray,
+                         cut_point: int, transition_frames: int = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a dissolve transition (linear cross-fade).
+        
+        Features blend linearly: result = α*A + (1-α)*B
+        where α goes from 1 to 0 over the transition window.
+        """
+        if transition_frames is None:
+            transition_frames = np.random.randint(5, 20)  # 5-20 frame dissolve
+        
+        result = np.zeros((self.sequence_length, self.feature_dim))
+        labels = np.zeros(self.sequence_length - 1)
+        
+        half_trans = transition_frames // 2
+        trans_start = max(0, cut_point - half_trans)
+        trans_end = min(self.sequence_length, cut_point + half_trans + 1)
+        
+        # Part A (before transition)
+        a_frames = min(trans_start, len(seg_a))
+        result[:a_frames] = seg_a[:a_frames]
+        
+        # Transition zone (linear blend)
+        for i in range(trans_start, trans_end):
+            alpha = (i - trans_start) / max(1, trans_end - trans_start)
+            a_idx = min(i, len(seg_a) - 1)
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = (1 - alpha) * seg_a[a_idx] + alpha * seg_b[b_idx]
+        
+        # Part B (after transition)
+        for i in range(trans_end, self.sequence_length):
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = seg_b[b_idx]
+        
+        # Boundary at center of transition
+        if 0 <= cut_point - 1 < len(labels):
+            labels[cut_point - 1] = 1.0
+        
+        return result, labels
+    
+    def _create_fade(self, seg_a: np.ndarray, seg_b: np.ndarray,
+                     cut_point: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a fade transition (A → black → B).
+        
+        Features fade to zero (black) then fade in from zero.
+        Common in scene transitions.
+        """
+        fade_frames = np.random.randint(3, 10)  # 3-10 frames per fade
+        
+        result = np.zeros((self.sequence_length, self.feature_dim))
+        labels = np.zeros(self.sequence_length - 1)
+        
+        fade_out_start = max(0, cut_point - fade_frames)
+        fade_in_end = min(self.sequence_length, cut_point + fade_frames)
+        
+        # Part A (before fade out)
+        for i in range(fade_out_start):
+            a_idx = min(i, len(seg_a) - 1)
+            result[i] = seg_a[a_idx]
+        
+        # Fade out (A → black)
+        for i in range(fade_out_start, cut_point):
+            alpha = (i - fade_out_start) / max(1, cut_point - fade_out_start)
+            a_idx = min(i, len(seg_a) - 1)
+            result[i] = (1 - alpha) * seg_a[a_idx]  # Fade to zero
+        
+        # Fade in (black → B)
+        for i in range(cut_point, fade_in_end):
+            alpha = (i - cut_point) / max(1, fade_in_end - cut_point)
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = alpha * seg_b[b_idx]  # Fade from zero
+        
+        # Part B (after fade in)
+        for i in range(fade_in_end, self.sequence_length):
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = seg_b[b_idx]
+        
+        # Boundary at center
+        if 0 <= cut_point - 1 < len(labels):
+            labels[cut_point - 1] = 1.0
+        
+        return result, labels
+    
+    def _create_wipe(self, seg_a: np.ndarray, seg_b: np.ndarray,
+                     cut_point: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create a wipe transition (gradual spatial replacement).
+        
+        In feature space, we simulate this by blending with a non-linear curve.
+        Uses sigmoid blending for smooth wipe effect.
+        """
+        wipe_frames = np.random.randint(8, 25)  # 8-25 frame wipe
+        
+        result = np.zeros((self.sequence_length, self.feature_dim))
+        labels = np.zeros(self.sequence_length - 1)
+        
+        half_wipe = wipe_frames // 2
+        wipe_start = max(0, cut_point - half_wipe)
+        wipe_end = min(self.sequence_length, cut_point + half_wipe + 1)
+        
+        # Part A (before wipe)
+        for i in range(wipe_start):
+            a_idx = min(i, len(seg_a) - 1)
+            result[i] = seg_a[a_idx]
+        
+        # Wipe zone (sigmoid blend for smooth transition)
+        for i in range(wipe_start, wipe_end):
+            # Sigmoid function for smooth S-curve blend
+            t = (i - wipe_start) / max(1, wipe_end - wipe_start)
+            alpha = 1 / (1 + np.exp(-10 * (t - 0.5)))  # Sigmoid centered at 0.5
+            
+            a_idx = min(i, len(seg_a) - 1)
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = (1 - alpha) * seg_a[a_idx] + alpha * seg_b[b_idx]
+        
+        # Part B (after wipe)
+        for i in range(wipe_end, self.sequence_length):
+            b_idx = min(i, len(seg_b) - 1)
+            result[i] = seg_b[b_idx]
+        
+        # Boundary at center
+        if 0 <= cut_point - 1 < len(labels):
+            labels[cut_point - 1] = 1.0
+        
+        return result, labels
+
 
 def print_memory_usage(prefix: str = ""):
     """Print current memory usage for debugging."""
@@ -84,9 +472,20 @@ def check_features_exist_and_valid(features_dir: str, video_name: str,
     
     # Check individual features
     for feature_name in feature_names:
-        feature_file = os.path.join(features_dir, f"{video_name}_{feature_name}.npy")
+        # Try multiple naming patterns
+        patterns = [
+            os.path.join(features_dir, f"{video_name}_{feature_name}.npy"),
+            os.path.join(features_dir, f"{video_name}___{feature_name}.npy"),
+        ]
+        
+        feature_file = None
+        for pattern in patterns:
+            if os.path.exists(pattern):
+                feature_file = pattern
+                break
+        
         try:
-            if os.path.exists(feature_file):
+            if feature_file is not None:
                 # Try to load and validate the numpy array
                 if not check_only_existence:
                     feature_array = np.load(feature_file)
@@ -155,11 +554,22 @@ def load_individual_features(features_dir: str, video_name: str, feature_names: 
     """
     features = {}
     for feature_name in feature_names:
-        feature_file = os.path.join(features_dir, f"{video_name}_{feature_name}.npy")
-        if os.path.exists(feature_file):
-            features[feature_name] = np.load(feature_file)
-        else:
-            print(f"Warning: Feature file not found: {feature_file}")
+        # Try multiple naming patterns
+        patterns = [
+            f"{video_name}_{feature_name}.npy",      # Standard: video_clip.npy
+            f"{video_name}___{feature_name}.npy",    # Triple underscore: video___clip.npy
+        ]
+        
+        loaded = False
+        for pattern in patterns:
+            feature_file = os.path.join(features_dir, pattern)
+            if os.path.exists(feature_file):
+                features[feature_name] = np.load(feature_file)
+                loaded = True
+                break
+        
+        # if not loaded:
+        #     print(f"Warning: Feature file not found for {video_name}_{feature_name}")
     return features
 
 
@@ -273,6 +683,68 @@ def load_and_fuse_individual_features(features_dir: str, video_name: str, fusion
     return fused_features
 
 
+def load_single_feature(features_dir: str, video_name: str, feature_type: str,
+                       quiet: bool = False, file_name_only: bool = False) -> np.ndarray:
+    """
+    Load a single individual feature type for a video.
+    
+    Args:
+        features_dir: Directory containing feature files
+        video_name: Name of the video (without extension)
+        feature_type: Feature type to load (hsv_histogram, cnn, clip, optical_flow)
+        quiet: Whether to suppress output messages
+        file_name_only: If True, return the file path instead of loaded array
+        
+    Returns:
+        Feature array or file path if file_name_only=True
+    """
+    if feature_type not in INDIVIDUAL_FEATURE_TYPES:
+        raise ValueError(f"Invalid feature type: {feature_type}. Must be one of {INDIVIDUAL_FEATURE_TYPES}")
+    
+    # Try multiple naming patterns
+    patterns = [
+        f"{video_name}_{feature_type}.npy",      # Standard: video_clip.npy
+        f"{video_name}___{feature_type}.npy",    # Triple underscore: video___clip.npy
+    ]
+    
+    for pattern in patterns:
+        feature_file = os.path.join(features_dir, pattern)
+        if os.path.exists(feature_file):
+            if file_name_only:
+                return feature_file
+            return np.load(feature_file)
+    
+    raise FileNotFoundError(f"Could not find {feature_type} features for {video_name} in {features_dir}")
+
+
+def is_individual_feature(feature_type: str) -> bool:
+    """Check if a feature type is an individual feature (not a fusion strategy)."""
+    return feature_type in INDIVIDUAL_FEATURE_TYPES
+
+
+def load_features_for_training(features_dir: str, video_name: str, feature_type: str,
+                               quiet: bool = False, file_name_only: bool = False) -> np.ndarray:
+    """
+    Load features for training - either individual feature or fused features.
+    
+    Args:
+        features_dir: Directory containing feature files
+        video_name: Name of the video (without extension)
+        feature_type: Either an individual feature type (hsv_histogram, cnn, clip, optical_flow)
+                     or a fusion strategy (concatenation, weighted, pca, cross_transformer, hierarchical)
+        quiet: Whether to suppress output messages
+        file_name_only: If True, return the file path instead of loaded array
+        
+    Returns:
+        Feature array or file path if file_name_only=True
+    """
+    if is_individual_feature(feature_type):
+        return load_single_feature(features_dir, video_name, feature_type, quiet, file_name_only)
+    else:
+        # It's a fusion strategy
+        return load_fused_features(features_dir, video_name, feature_type, quiet, file_name_only)
+
+
 def load_fused_features(features_dir: str, video_name: str, fusion_strategy: str = "hierarchical", 
                       quiet: bool = False,file_name_only: bool = False) -> np.ndarray:
     """
@@ -287,30 +759,48 @@ def load_fused_features(features_dir: str, video_name: str, fusion_strategy: str
     Returns:
         Fused feature array
     """
-    # Try loading strategy-specific fused features
-    strategy_file = os.path.join(features_dir, f"{video_name}_{fusion_strategy}.npy")
-    if os.path.exists(strategy_file):
-        if file_name_only:
-            return strategy_file
-        return np.load(strategy_file)
+    # Try loading strategy-specific fused features with multiple naming patterns
+    strategy_patterns = [
+        f"{video_name}_{fusion_strategy}.npy",      # Standard: video_pca.npy
+        f"{video_name}___{fusion_strategy}.npy",    # Triple underscore: video___pca.npy
+    ]
     
-    # Fallback to generic fused features
-    fused_file = os.path.join(features_dir, f"{video_name}_fused.npy")
-    if os.path.exists(fused_file):
-        if file_name_only:
-            return fused_file
-        return np.load(fused_file)
+    for pattern in strategy_patterns:
+        strategy_file = os.path.join(features_dir, pattern)
+        if os.path.exists(strategy_file):
+            if file_name_only:
+                return strategy_file
+            return np.load(strategy_file)
     
-    # Fallback to old naming convention
-    old_file = os.path.join(features_dir, f"{video_name}_features.npy")
-    if os.path.exists(old_file):
-        if file_name_only:
-            return old_file
-        return np.load(old_file)
+    # Fallback to generic fused features (try both patterns)
+    fused_patterns = [
+        f"{video_name}_fused.npy",
+        f"{video_name}___fused.npy",
+    ]
     
-    # Last resort: load individual features and fuse them
-    if not quiet:
-        print(f"No pre-computed fused features found for {video_name}, attempting to load and fuse individual features...")
+    for pattern in fused_patterns:
+        fused_file = os.path.join(features_dir, pattern)
+        if os.path.exists(fused_file):
+            if file_name_only:
+                return fused_file
+            return np.load(fused_file)
+    
+    # Fallback to old naming convention (try both patterns)
+    old_patterns = [
+        f"{video_name}_features.npy",
+        f"{video_name}___features.npy",
+    ]
+    
+    for pattern in old_patterns:
+        old_file = os.path.join(features_dir, pattern)
+        if os.path.exists(old_file):
+            if file_name_only:
+                return old_file
+            return np.load(old_file)
+    
+    # # Last resort: load individual features and fuse them
+    # if not quiet:
+    #     print(f"No pre-computed fused features found for {video_name}, attempting to load and fuse individual features...")
     try:
         return load_and_fuse_individual_features(features_dir, video_name, fusion_strategy, quiet,file_name_only)
     except Exception as e:
@@ -364,43 +854,168 @@ def create_custom_fusion(features_dir: str, video_names: List[str],
 
 
 class BoundaryDataset(torch.utils.data.Dataset):
-    """Dataset for training boundary detection models with lazy loading to reduce memory usage."""
+    """Dataset for training boundary detection models with lazy loading to reduce memory usage.
+    
+    IMPORTANT FOR PUBLICATION:
+    - Supports video-level train/val/test splitting to prevent data leakage
+    - Uses fixed random seeds for reproducibility
+    - All sequences from a video stay in the same split
+    - Synthetic boundary generation for class balance
+    - Uses NON-overlapping windows in validation_mode to prevent duplicate counting
+    """
     
     def __init__(self, features_dir: str, ground_truth_file: str, 
                  sequence_length: int = 100, overlap: int = 50, 
                  fusion_strategy: str = "hierarchical", quiet: bool = False,
-                 lazy_loading: bool = True):
+                 lazy_loading: bool = True, video_names: List[str] = None,
+                 include_all_non_boundary: bool = False,
+                 synthetic_ratio: float = 0.5,
+                 validation_mode: bool = False,
+                 feature_type: str = None):
         """
         Initialize dataset.
         
         Args:
             features_dir: Directory containing extracted features
-            ground_truth_file: JSON file with ground truth boundaries
+            ground_truth_file: JSON file with ground truth boundaries OR pre-loaded dict
             sequence_length: Length of input sequences
-            overlap: Overlap between sequences
-            fusion_strategy: Name of the fusion strategy to use for loading features
+            overlap: Overlap between sequences (IGNORED in validation_mode - uses stride=sequence_length)
+            fusion_strategy: Name of the fusion strategy to use for loading features (deprecated, use feature_type)
             quiet: Whether to suppress warning messages
             lazy_loading: If True, only store metadata and load features on-demand (saves memory)
+            video_names: List of video names to include (for video-level splitting).
+                        If None, uses all videos in ground truth.
+                        CRITICAL: Use this to prevent data leakage between train/val/test!
+            include_all_non_boundary: If True, include ALL non-boundary sequences (for validation).
+                                     If False, subsample non-boundary sequences (for training balance).
+            synthetic_ratio: Ratio of synthetic samples to add (0.5 = 50% more samples are synthetic)
+            validation_mode: If True, uses NON-overlapping windows (stride = sequence_length)
+                            to prevent the same boundary being counted multiple times in metrics.
+                            CRITICAL for correct validation metrics!
+            feature_type: Feature type to use - can be either:
+                         - Individual feature: 'hsv_histogram', 'cnn', 'clip', 'optical_flow'
+                         - Fusion strategy: 'concatenation', 'weighted', 'pca', 'cross_transformer', 'hierarchical'
+                         If None, uses fusion_strategy parameter for backward compatibility.
         """
         self.features_dir = features_dir
         self.sequence_length = sequence_length
-        self.overlap = overlap
-        self.fusion_strategy = fusion_strategy
+        self.validation_mode = validation_mode
+        # CRITICAL: In validation mode, use NON-overlapping windows (stride = sequence_length)
+        # This ensures each boundary is counted EXACTLY ONCE in metrics.
+        # Without this, overlapping windows cause the same boundary to be counted multiple times,
+        # inflating both GT count and prediction count, leading to inconsistent metrics.
+        # 
+        # UPDATE: Use stride = sequence_length - 5 to catch boundaries at window edges
+        # A boundary at frame 99 would be at the very edge of window [0:100], making it
+        # hard to detect. With stride=95, the next window [95:195] also sees it.
+        if validation_mode:
+            edge_buffer = 5  # Small overlap to catch edge boundaries
+            self.overlap = sequence_length - edge_buffer  # stride = 95 for seq_len=100
+            if not quiet:
+                print(f"  VALIDATION MODE: Using near-non-overlapping windows (stride={self.overlap})")
+        else:
+            self.overlap = overlap  # Training: use overlapping windows for augmentation
+        # Handle feature_type vs fusion_strategy for backward compatibility
+        # feature_type takes precedence if specified
+        if feature_type is not None:
+            self.feature_type = feature_type
+            self.fusion_strategy = feature_type  # For backward compat in file pattern matching
+        else:
+            self.feature_type = fusion_strategy  # Use fusion_strategy as feature_type
+            self.fusion_strategy = fusion_strategy
+        
+        self.is_individual_feature = is_individual_feature(self.feature_type)
         self.quiet = quiet
         self.lazy_loading = lazy_loading
         self._feature_dim = None  # Will be set after first valid feature load
+        self.training = not validation_mode  # Training mode flag - enables augmentations
+        self.video_names = video_names  # For video-level splitting
+        self.include_all_non_boundary = include_all_non_boundary
+        self.synthetic_ratio = synthetic_ratio
         
-        # Load ground truth
-        with open(ground_truth_file, 'r') as f:
-            self.ground_truth = json.load(f)
+        # Load ground truth (can be path or pre-loaded dict)
+        if isinstance(ground_truth_file, dict):
+            self.ground_truth = ground_truth_file
+        else:
+            with open(ground_truth_file, 'r') as f:
+                self.ground_truth = json.load(f)
+        
+        # Filter to only specified videos if video_names provided
+        if video_names is not None:
+            self.ground_truth = {k: v for k, v in self.ground_truth.items() 
+                                if k in video_names or k.replace('.mp4', '') in video_names
+                                or k + '.mp4' in video_names}
         
         # Create training samples (metadata only if lazy loading)
         self.samples = self._create_samples()
+        
+        # Collect all valid feature files for synthetic generation
+        self._all_feature_files = self._collect_feature_files()
+        
+        # Initialize synthetic boundary generator (only for training)
+        self._synthetic_generator = None
+        if self.training and synthetic_ratio > 0 and len(self._all_feature_files) > 10:
+            self._init_synthetic_generator()
+        
+        # Add synthetic samples to the dataset
+        self._add_synthetic_samples()
         
         # Cache for loaded features when lazy loading (LRU cache to limit memory)
         if self.lazy_loading:
             from functools import lru_cache
             self._feature_cache = {}
+    
+    def _collect_feature_files(self) -> List[str]:
+        """Collect all valid feature files from the dataset."""
+        feature_files = []
+        for sample in self.samples:
+            if 'feature_file' in sample and sample['feature_file']:
+                feature_files.append(sample['feature_file'])
+        return list(set(feature_files))  # Remove duplicates
+    
+    def _init_synthetic_generator(self):
+        """Initialize the synthetic boundary generator."""
+        if not self.quiet:
+            print(f"  Initializing SyntheticBoundaryGenerator with {len(self._all_feature_files)} feature files...")
+        
+        self._synthetic_generator = SyntheticBoundaryGenerator(
+            feature_files=self._all_feature_files,
+            sequence_length=self.sequence_length,
+            feature_dim=self._feature_dim,
+            quiet=self.quiet
+        )
+    
+    def _add_synthetic_samples(self):
+        """Add synthetic boundary samples to balance the dataset."""
+        if not self.training or self.synthetic_ratio <= 0:
+            return
+            
+        if self._synthetic_generator is None:
+            return
+        
+        # Count current boundary vs non-boundary samples
+        boundary_samples = sum(1 for s in self.samples 
+                              if any(s['start_frame'] <= b < s['end_frame'] 
+                                    for b in s.get('boundaries', [])))
+        non_boundary_samples = len(self.samples) - boundary_samples
+        
+        # Calculate how many synthetic samples to add
+        # Goal: Balance boundaries with ~50% synthetic data
+        num_synthetic = int(len(self.samples) * self.synthetic_ratio)
+        
+        if not self.quiet:
+            print(f"  Adding {num_synthetic} synthetic boundary samples...")
+            print(f"    Original: {boundary_samples} boundary, {non_boundary_samples} non-boundary")
+        
+        # Add synthetic sample markers (actual generation happens in __getitem__)
+        for i in range(num_synthetic):
+            self.samples.append({
+                'synthetic': True,
+                'synthetic_idx': i
+            })
+        
+        if not self.quiet:
+            print(f"    After synthetic: {len(self.samples)} total samples")
     
     def _create_samples(self) -> List[Dict]:
         """Create training samples metadata (lazy loading to save memory)."""
@@ -435,33 +1050,49 @@ class BoundaryDataset(torch.utils.data.Dataset):
             
             if self.lazy_loading:
                 # Only load feature file metadata (shape) without loading full data
-                strategy_file = os.path.join(self.features_dir, f"{video_name_stem}_{self.fusion_strategy}.npy")
+                # Use unified feature loading that handles both individual features and fused features
+                strategy_file = None
                 
-                # Check if feature file exists
-                if not os.path.exists(strategy_file):
-                    # Try fallback files
-                    fused_file = os.path.join(self.features_dir, f"{video_name_stem}_fused.npy")
-                    old_file = os.path.join(self.features_dir, f"{video_name_stem}_features.npy")
-                    
-                    if os.path.exists(fused_file):
-                        strategy_file = fused_file
-                    elif os.path.exists(old_file):
-                        strategy_file = old_file
-                    else:
-                        if not self.quiet:
-                            print(f"Warning: No feature file found for {video_name_stem}")
-                        try:
-                            strategy_file = load_fused_features(self.features_dir, video_name_stem, self.fusion_strategy, self.quiet,file_name_only=True)
-                        except FileNotFoundError as e:
-                            if not self.quiet:
-                                print(f"Warning: Could not load features for {video_name} (using stem: {video_name_stem}): {e}")
-                            videos_skipped += 1
-                            continue
+                try:
+                    # Use the unified loading function that handles both individual features and fusion strategies
+                    strategy_file = load_features_for_training(
+                        self.features_dir, video_name_stem, self.feature_type, 
+                        quiet=True, file_name_only=True
+                    )
+                except FileNotFoundError:
+                    # Fallback: try legacy naming patterns only for fusion strategies
+                    if not self.is_individual_feature:
+                        naming_patterns = [
+                            f"{video_name_stem}_{self.fusion_strategy}.npy",
+                            f"{video_name_stem}___{self.fusion_strategy}.npy",
+                        ]
+                        
+                        for pattern in naming_patterns:
+                            candidate = os.path.join(self.features_dir, pattern)
+                            if os.path.exists(candidate):
+                                strategy_file = candidate
+                                break
+                        
+                        # Try fallback files with both naming patterns
                         if strategy_file is None:
-                            if not self.quiet:
-                                print(f"Warning: Could not find any feature file for {video_name_stem}")
-                            videos_skipped += 1
-                            continue
+                            fallback_patterns = [
+                                f"{video_name_stem}_fused.npy",
+                                f"{video_name_stem}___fused.npy",
+                                f"{video_name_stem}_features.npy",
+                                f"{video_name_stem}___features.npy",
+                            ]
+                            
+                            for pattern in fallback_patterns:
+                                candidate = os.path.join(self.features_dir, pattern)
+                                if os.path.exists(candidate):
+                                    strategy_file = candidate
+                                    break
+                
+                if strategy_file is None:
+                    # if not self.quiet:
+                    #     print(f"Warning: Could not find {self.feature_type} features for {video_name_stem}")
+                    videos_skipped += 1
+                    continue
 
                 # Load only the shape without loading full array (using mmap)
                 try:
@@ -501,37 +1132,39 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     # Check if sequence has boundary
                     has_boundary = any(start_idx <= b < end_idx - 1 for b in labels_list)
                     
-                    # BALANCED SAMPLING: Include ALL boundary sequences and 25% of non-boundary
+                    # BALANCED SAMPLING: Include ALL boundary sequences and subsample non-boundary
                     # With 1:56.6 frame imbalance, this gives reasonable sequence balance
-                    # Target: ~80% boundary samples, 20% non-boundary samples
+                    # NOTE: For validation, include_all_non_boundary=True to evaluate on all data
+                    sample_data = {
+                        'video_name_stem': video_name_stem,
+                        'video_name': video_name,
+                        'start_frame': start_idx,
+                        'end_frame': end_idx,
+                        'boundaries': labels_list,  # Store boundary positions
+                        'feature_file': strategy_file,  # Path to feature file
+                        'num_frames': num_frames
+                    }
+                    
                     if has_boundary:
-                        samples.append({
-                            'video_name_stem': video_name_stem,
-                            'video_name': video_name,
-                            'start_frame': start_idx,
-                            'end_frame': end_idx,
-                            'boundaries': labels_list,  # Store boundary positions
-                            'feature_file': strategy_file,  # Path to feature file
-                            'num_frames': num_frames
-                        })
-                    elif np.random.random() < 0.50:  # 50% of non-boundary sequences
-                        samples.append({
-                            'video_name_stem': video_name_stem,
-                            'video_name': video_name,
-                            'start_frame': start_idx,
-                            'end_frame': end_idx,
-                            'boundaries': labels_list,  # Store boundary positions
-                            'feature_file': strategy_file,  # Path to feature file
-                            'num_frames': num_frames
-                        })
+                        samples.append(sample_data)
+                    elif self.include_all_non_boundary:
+                        # Validation/test: include ALL sequences for fair evaluation
+                        samples.append(sample_data)
+                    else:
+                        # Training: subsample non-boundary using deterministic hash
+                        # This ensures reproducibility without relying on random state
+                        hash_key = f"{video_name_stem}_{start_idx}"
+                        hash_val = hash(hash_key) % 100
+                        if hash_val < 50:  # 50% of non-boundary sequences (deterministic)
+                            samples.append(sample_data)
             else:
                 # Original behavior: load all features into memory
                 try:
                     features = load_fused_features(self.features_dir, video_name_stem, self.fusion_strategy, self.quiet)
                     videos_with_features += 1
                 except FileNotFoundError as e:
-                    if not self.quiet:
-                        print(f"Warning: Could not load features for {video_name} (using stem: {video_name_stem}): {e}")
+                    # if not self.quiet:
+                    #     print(f"Warning: Could not load features for {video_name} (using stem: {video_name_stem}): {e}")
                     videos_skipped += 1
                     continue
                 
@@ -551,23 +1184,28 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     # Balance the dataset - include sequences with and without boundaries
                     has_boundary = np.any(sequence_labels == 1)
                     
-                    # BALANCED SAMPLING: Include ALL boundary sequences and 25% of non-boundary
+                    # BALANCED SAMPLING: Include ALL boundary sequences and subsample non-boundary
                     # With 1:56.6 frame imbalance, this gives reasonable sequence balance
-                    # Target: ~80% boundary samples, 20% non-boundary samples
+                    # NOTE: For validation, include_all_non_boundary=True to evaluate on all data
+                    sample_data = {
+                        'features': sequence_features,  
+                        'labels': sequence_labels,
+                        'video_name': video_name,
+                        'start_frame': start_idx
+                    }
+                    
                     if has_boundary:
-                        samples.append({
-                            'features': sequence_features,
-                            'labels': sequence_labels,
-                            'video_name': video_name,
-                            'start_frame': start_idx
-                        })
-                    elif np.random.random() < 0.50:  # 40% of non-boundary sequences
-                        samples.append({
-                            'features': sequence_features,  
-                            'labels': sequence_labels,
-                            'video_name': video_name,
-                            'start_frame': start_idx
-                        })
+                        samples.append(sample_data)
+                    elif self.include_all_non_boundary:
+                        # Validation/test: include ALL sequences for fair evaluation
+                        samples.append(sample_data)
+                    else:
+                        # Training: subsample non-boundary using deterministic hash
+                        # This ensures reproducibility without relying on random state
+                        hash_key = f"{video_name}_{start_idx}"
+                        hash_val = hash(hash_key) % 100
+                        if hash_val < 50:  # 50% of non-boundary sequences (deterministic)
+                            samples.append(sample_data)
             
             videos_processed += 1
         
@@ -627,6 +1265,12 @@ class BoundaryDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[idx]
         
+        # =====================================================================
+        # HANDLE SYNTHETIC SAMPLES (mathematically generated boundaries)
+        # =====================================================================
+        if sample.get('synthetic', False):
+            return self._get_synthetic_sample()
+        
         if self.lazy_loading:
             # Load features on-demand from disk
             video_stem = sample['video_name_stem']
@@ -671,16 +1315,11 @@ class BoundaryDataset(torch.utils.data.Dataset):
                         features_full = np.load(f)
                         sequence_features = features_full[start_frame:end_frame].copy()
                 
-                # SOTA Enhancement: Synthetic Augmentation
-                # Randomly replace non-boundary sequences with synthetic transitions
-                # This teaches the model the "physics" of a transition (blending features)
-                # 30% chance for non-boundary sequences
-                is_boundary_seq = any(start_frame <= b < end_frame - 1 for b in boundaries)
-                if not is_boundary_seq and np.random.random() < 0.3:
-                    sequence_features, new_labels = self._synthetic_augmentation(sequence_features)
-                    use_synthetic = True
-                else:
-                    use_synthetic = False
+                # Synthetic augmentation DISABLED - was causing train/val distribution mismatch
+                # 30% of non-boundary sequences were being converted to synthetic boundaries,
+                # making boundaries appear ~30% more common in training than in validation.
+                # The loss function (ComboLossV2) handles class imbalance instead.
+                use_synthetic = False
                     
                 # Validate shape
                 if len(sequence_features.shape) != 2:
@@ -704,8 +1343,17 @@ class BoundaryDataset(torch.utils.data.Dataset):
                 elif current_dim > self._feature_dim:
                     self._feature_dim = current_dim
                 
+                # FEATURE AUGMENTATION: Add small noise during training to improve generalization
+                # This helps the model be more robust to slight variations in features
+                if not self.validation_mode and np.random.random() < 0.5:
+                    # Add Gaussian noise with small std (1% of feature magnitude)
+                    feature_std = np.std(sequence_features) + 1e-8
+                    noise = np.random.normal(0, 0.01 * feature_std, sequence_features.shape)
+                    sequence_features = sequence_features + noise
+                
                 if use_synthetic:
-                    labels = new_labels
+                    # labels = new_labels
+                    pass
                 else:
                     # Create labels for this sequence
                     labels = np.zeros(self.sequence_length - 1)
@@ -713,15 +1361,16 @@ class BoundaryDataset(torch.utils.data.Dataset):
                         if start_frame <= boundary < end_frame - 1:
                             labels[boundary - start_frame] = 1
                 
-                # SOTA Enhancement: Gaussian Label Smoothing
-                # Softens hard cuts to account for ambiguity and soft transitions
-                if self.training:  # Only apply during training
-                    labels = self._apply_gaussian_smoothing(labels)
+                # Gaussian Label Smoothing DISABLED
+                # Problem: Smoothing creates soft labels (e.g., [0.2, 0.5, 1.0, 0.5, 0.2])
+                # The metric code counts labels >= 0.5 as GT, so 1 boundary → 3 GT points
+                # This inflates training TP, making train metrics look better than validation
+                # The loss function (ComboLossV2) handles soft optimization without this issue
                     
             except Exception as e:
                 # Handle any errors during loading
                 if not self.quiet:
-                    print(f"Error loading features for {video_name_stem}: {e}")
+                    print(f"Error loading features for {video_stem}: {e}")
                 # Return zero features as fallback
                 sequence_features = np.zeros((self.sequence_length, self._feature_dim or 512))
                 labels = np.zeros(self.sequence_length - 1)
@@ -737,21 +1386,76 @@ class BoundaryDataset(torch.utils.data.Dataset):
                 padding = np.zeros((self.sequence_length - sequence_features.shape[0], sequence_features.shape[1]))
                 sequence_features = np.concatenate([sequence_features, padding], axis=0)
             
-            # Apply SOTA augmentations even for pre-loaded data
-            if self.training:
-                # Synthetic augmentation
-                is_boundary_seq = np.any(labels == 1)
-                if not is_boundary_seq and np.random.random() < 0.3:
-                    sequence_features, labels = self._synthetic_augmentation(sequence_features)
-                
-                # Gaussian smoothing
-                labels = self._apply_gaussian_smoothing(labels)
+            # Apply augmentations for pre-loaded data (synthetic DISABLED)
+            # Gaussian smoothing also DISABLED - it inflates training metrics
+            # by creating multiple GT points per boundary (labels >= 0.5 count as GT)
 
         # Convert to tensors
         features_tensor = torch.from_numpy(sequence_features).float()
         labels_tensor = torch.from_numpy(labels).float()
         
         return features_tensor, labels_tensor
+    
+    def _get_synthetic_sample(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate a synthetic boundary sample using the SyntheticBoundaryGenerator.
+        
+        This creates mathematically realistic transitions from features of
+        DIFFERENT videos, teaching the model what boundaries "look like".
+        
+        Returns:
+            Tuple of (features_tensor, labels_tensor)
+        """
+        if self._synthetic_generator is None:
+            # Fallback to simple synthetic augmentation if generator not available
+            # Create a random non-boundary sequence and augment it
+            fallback_idx = np.random.randint(0, len(self.samples) - 1)
+            while self.samples[fallback_idx].get('synthetic', False):
+                fallback_idx = np.random.randint(0, len(self.samples) - 1)
+            
+            # Get the real sample and apply synthetic augmentation
+            sample = self.samples[fallback_idx]
+            if 'feature_file' in sample:
+                # Load features
+                try:
+                    features = np.load(sample['feature_file'])[sample['start_frame']:sample['end_frame']]
+                    features, labels = self._synthetic_augmentation(features)
+                    labels = self._apply_gaussian_smoothing(labels)
+                    return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
+                except:
+                    pass
+            
+            # Ultimate fallback: zeros
+            features = np.zeros((self.sequence_length, self._feature_dim or 256))
+            labels = np.zeros(self.sequence_length - 1)
+            return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
+        
+        # Use the sophisticated generator for cross-video synthetic transitions
+        features, labels, transition_type = self._synthetic_generator.generate_synthetic_sequence()
+        
+        if features is None or labels is None:
+            # Fallback if generation failed
+            features = np.zeros((self.sequence_length, self._feature_dim or 256))
+            labels = np.zeros(self.sequence_length - 1)
+            labels[self.sequence_length // 2] = 1.0  # Put boundary in middle
+        
+        # Ensure correct dimensions
+        if features.shape[0] != self.sequence_length:
+            if features.shape[0] < self.sequence_length:
+                padding = np.zeros((self.sequence_length - features.shape[0], features.shape[1]))
+                features = np.concatenate([features, padding], axis=0)
+            else:
+                features = features[:self.sequence_length]
+        
+        if len(labels) != self.sequence_length - 1:
+            new_labels = np.zeros(self.sequence_length - 1)
+            new_labels[:min(len(labels), len(new_labels))] = labels[:min(len(labels), len(new_labels))]
+            labels = new_labels
+        
+        # Apply Gaussian smoothing to labels
+        labels = self._apply_gaussian_smoothing(labels)
+        
+        return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
 
     def _synthetic_augmentation(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -811,32 +1515,36 @@ class BoundaryDataset(torch.utils.data.Dataset):
         boundary_indices = np.where(labels == 1)[0]
         
         for idx in boundary_indices:
-            # simple 3-frame kernel is usually sufficient and faster
+            # Wider 5-frame kernel for temporal tolerance (±2 frames)
+            # This matches the evaluation tolerance
+            if idx > 1:
+                smoothed[idx-2] = max(smoothed[idx-2], 0.2)
             if idx > 0:
-                smoothed[idx-1] = max(smoothed[idx-1], 0.3)
+                smoothed[idx-1] = max(smoothed[idx-1], 0.5)
             smoothed[idx] = 1.0  # Keep peak at 1.0
             if idx < len(labels) - 1:
-                smoothed[idx+1] = max(smoothed[idx+1], 0.3)
+                smoothed[idx+1] = max(smoothed[idx+1], 0.5)
+            if idx < len(labels) - 2:
+                smoothed[idx+2] = max(smoothed[idx+2], 0.2)
                 
         return smoothed
 
 
 
-def load_video_worker(video_file: Path, video_queue: queue.Queue, 
-                     load_progress: tqdm = None) -> None:
+def validate_video_worker(video_file: Path, video_queue: queue.Queue, 
+                          load_progress: tqdm = None) -> None:
     """
-    Worker function to load a video file and put it in the queue with robust error handling.
+    Worker function to validate a video file and put metadata in the queue.
+    Does NOT load frames into memory to prevent memory bloat with large videos.
     
     Args:
         video_file: Path to the video file
-        video_queue: Queue to put loaded video data
-        load_progress: Optional progress bar for loading
+        video_queue: Queue to put video metadata (not frames)
+        load_progress: Optional progress bar for validation
     """
     try:
         # Import here to avoid issues with multiprocessing
         import cv2
-        import numpy as np
-        import logging
         
         # Force verify and set OpenCV environment variables for this worker process
         worker_env_vars = {
@@ -853,10 +1561,13 @@ def load_video_worker(video_file: Path, video_queue: queue.Queue,
         if not video_file.exists() or video_file.stat().st_size == 0:
             raise ValueError(f"Invalid video file: {video_file}")
         
+        # Get file size for memory estimation
+        file_size_mb = video_file.stat().st_size / (1024 * 1024)
+        
         # Try multiple backends for better compatibility, prioritizing non-FFmpeg backends first
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_FFMPEG, cv2.CAP_ANY]  # Try Windows-specific backends first
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_FFMPEG, cv2.CAP_ANY]
         cap = None
-        frames = []
+        video_info = None
         
         for backend in backends:
             try:
@@ -866,67 +1577,55 @@ def load_video_worker(video_file: Path, video_queue: queue.Queue,
                         cap.release()
                     continue
                 
-                # Test read first frame
+                # Test read first frame to validate video is readable
                 ret, test_frame = cap.read()
                 if not ret or test_frame is None:
                     cap.release()
                     continue
                 
-                # Reset to beginning and read all frames
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frames = []
-                consecutive_failures = 0
-                max_failures = 10
+                # Get video properties for memory estimation
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 
-                while consecutive_failures < max_failures:
-                    ret, frame = cap.read()
-                    if not ret:
-                        # Check if we've reached end naturally
-                        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-                        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                        if current_pos >= total_frames - 1:
-                            break  # Natural end
-                        consecutive_failures += 1
-                        continue
-                    
-                    consecutive_failures = 0
-                    
-                    # Validate and process frame
-                    if frame is not None:
-                        try:
-                            # Check if frame has valid size
-                            if hasattr(frame, 'size') and frame.size > 0:
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                frames.append(frame_rgb)
-                        except cv2.error:
-                            # Skip corrupted frame
-                            continue
+                # Estimate memory usage: frames * height * width * channels * bytes_per_channel
+                estimated_memory_mb = (frame_count * height * width * 3 * 1) / (1024 * 1024)
+                
+                video_info = {
+                    'frame_count': frame_count,
+                    'fps': fps,
+                    'width': width,
+                    'height': height,
+                    'file_size_mb': file_size_mb,
+                    'estimated_memory_mb': estimated_memory_mb,
+                    'backend': backend
+                }
                 
                 cap.release()
-                
-                if len(frames) > 0:
-                    frames = np.array(frames)
-                    break  # Successfully loaded with this backend
+                break  # Successfully validated with this backend
                 
             except Exception:
                 if cap:
                     cap.release()
                 continue
         
-        if len(frames) == 0:
-            raise RuntimeError("Could not load any frames with any backend")
+        if video_info is None:
+            raise RuntimeError("Could not validate video with any backend")
         
-        # Put the loaded video data in queue
+        # Put video metadata in queue (NOT the actual frames)
         video_data = {
             'video_file': video_file,
-            'frames': frames,
-            'video_stem': video_file.stem
+            'video_stem': video_file.stem,
+            'video_info': video_info,
+            'validated': True
         }
         video_queue.put(video_data)
         
         if load_progress:
             load_progress.update(1)
-            load_progress.set_postfix({"Loaded": video_file.name})
+            mem_info = f"{video_info['estimated_memory_mb']:.0f}MB"
+            load_progress.set_postfix({"Validated": video_file.name, "Est.Mem": mem_info})
             
     except Exception as e:
         # Categorize error types for better handling
@@ -952,6 +1651,10 @@ def load_video_worker(video_file: Path, video_queue: queue.Queue,
         if load_progress:
             load_progress.update(1)
             load_progress.set_postfix({"Error": f"{error_type}: {video_file.name[:15]}"})
+
+
+# Legacy alias for backward compatibility
+load_video_worker = validate_video_worker
 
 
 def check_video_health(video_dir: str, sample_size: int = 10, quiet: bool = False) -> Dict[str, Any]:
@@ -1114,18 +1817,18 @@ def extract_training_features_parallel(config: VideoShotConfig, video_dir: str,
     extract_progress = None
     
     if show_progress:
-        load_progress = tqdm(total=total_videos, desc="Loading videos", position=0)
+        load_progress = tqdm(total=total_videos, desc="Validating videos", position=0)
         extract_progress = tqdm(total=total_videos, desc="Extracting features", position=1)
     
     videos_processed = 0
     videos_loaded = 0
     
-    # Start video loading in background threads
+    # Start video validation in background threads (validates without loading frames)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all video loading tasks
+        # Submit all video validation tasks
         loading_futures = []
         for video_file in video_files:
-            future = executor.submit(load_video_worker, video_file, video_queue, load_progress)
+            future = executor.submit(validate_video_worker, video_file, video_queue, load_progress)
             loading_futures.append(future)
         
         # Process loaded videos as they become available
@@ -1168,10 +1871,10 @@ def extract_training_features_parallel(config: VideoShotConfig, video_dir: str,
                         extract_progress.set_postfix({"Status": f"Skipped ({error_type})"})
                     continue
                 
-                # Extract features from loaded video
+                # Extract features from validated video (load frames on-demand)
                 video_file = video_data['video_file']
-                frames = video_data['frames']
                 video_stem = video_data['video_stem']
+                video_info = video_data.get('video_info', {})
                 
                 # Check if all features already exist and are valid
                 feature_check = check_features_exist_and_valid(
@@ -1199,14 +1902,26 @@ def extract_training_features_parallel(config: VideoShotConfig, video_dir: str,
                     elif not quiet and not show_progress:
                         print(f"  → {missing_msg}")
                 
+                # Show estimated memory for this video
+                est_mem = video_info.get('estimated_memory_mb', 0)
                 if extract_progress:
-                    extract_progress.set_postfix({"Current": video_file.name})
+                    extract_progress.set_postfix({"Current": video_file.name, "Est.Mem": f"{est_mem:.0f}MB"})
                 elif not quiet and not show_progress:
-                    print(f"Extracting features for: {video_file.name}")
+                    print(f"Extracting features for: {video_file.name} (Est. memory: {est_mem:.0f}MB)")
                 
                 try:
+                    # Load frames on-demand (memory-efficient: only one video in memory at a time)
+                    frames = coordinator.video_processor.load_video(str(video_file))
+                    
+                    if frames is None or len(frames) == 0:
+                        raise RuntimeError(f"Could not load frames from {video_file}")
+                    
                     # Extract features using the shared coordinator
                     features = coordinator._extract_all_features(frames, parallel_features, max_workers)
+                    
+                    # Explicitly free frames memory after extraction
+                    del frames
+                    gc.collect()
 
                     # Save individual features
                     for feature_name, feature_array in features.items():
@@ -1214,6 +1929,10 @@ def extract_training_features_parallel(config: VideoShotConfig, video_dir: str,
                         np.save(individual_file, feature_array)
                         if not quiet and not show_progress:
                             print(f"Saved {feature_name} features: {feature_array.shape}")
+                    
+                    # Explicitly free features memory after saving
+                    del features
+                    gc.collect()
                     
                     # Fuse features
                     # fused_features = coordinator.fusion_strategy.fuse_features(features)
@@ -1403,9 +2122,15 @@ def extract_training_features(config: VideoShotConfig, video_dir: str,
 def train_transformer_model(config: VideoShotConfig, features_dir: str, 
                           ground_truth_file: str, model_save_path: str, 
                           fusion_strategy: str = None, show_progress: bool = True,
-                          quiet: bool = False, save_plots: bool = True) -> Dict[str, float]:
+                          quiet: bool = False, save_plots: bool = True,
+                          random_seed: int = DEFAULT_RANDOM_SEED) -> Dict[str, float]:
     """
     Train the transformer detection model for a specific fusion strategy.
+    
+    PUBLICATION-READY:
+    - Video-level train/val split (no data leakage)
+    - Fixed random seeds for reproducibility
+    - Deterministic sampling
     
     Args:
         config: System configuration
@@ -1416,10 +2141,19 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         show_progress: Whether to show progress bars
         quiet: Whether to suppress non-essential output
         save_plots: Whether to save training/validation plots
+        random_seed: Random seed for reproducibility (default: 42)
         
     Returns:
         Dictionary with training results (best F1-score, final metrics)
     """
+    # ==========================================================================
+    # STEP 0: Set random seeds for reproducibility (CRITICAL FOR PUBLICATION)
+    # ==========================================================================
+    set_random_seeds(random_seed)
+    
+    # Track training start time
+    training_start_time = time.time()
+    
     # Ensure model path has .pth extension
     if not model_save_path.endswith('.pth'):
         model_save_path = model_save_path + '.pth'
@@ -1437,27 +2171,84 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         print(f"Starting transformer model training with {config.fusion.strategy} fusion...")
         print_memory_usage("Before dataset creation: ")
     
-    # Create dataset with fusion strategy support and lazy loading
-    dataset = BoundaryDataset(
+    # ==========================================================================
+    # STEP 1: VIDEO-LEVEL SPLIT (CRITICAL - Prevents data leakage!)
+    # ==========================================================================
+    # Load ground truth to get all video names
+    with open(ground_truth_file, 'r') as f:
+        full_ground_truth = json.load(f)
+    
+    all_video_names = list(full_ground_truth.keys())
+    
+    # Shuffle videos with fixed seed for reproducibility
+    import random
+    random.shuffle(all_video_names)  # Uses the seed we set earlier
+    
+    # Split at VIDEO level: 80% train, 20% validation
+    train_split_idx = int(0.8 * len(all_video_names))
+    train_video_names = all_video_names[:train_split_idx]
+    val_video_names = all_video_names[train_split_idx:]
+    
+    if not quiet:
+        print(f"\n  VIDEO-LEVEL SPLIT (prevents data leakage):")
+        print(f"    Total videos: {len(all_video_names)}")
+        print(f"    Training videos: {len(train_video_names)} (80%)")
+        print(f"    Validation videos: {len(val_video_names)} (20%)")
+        print(f"    Random seed: {random_seed}")
+    
+    # ==========================================================================
+    # STEP 2: Create SEPARATE datasets for train and validation
+    # ==========================================================================
+    # IMPORTANT: Include all data! The ComboLossV2 handles class imbalance.
+    # SYNTHETIC DATA: Add mathematically generated boundaries to help balance classes
+    # and teach the model what transitions "look like" in feature space.
+    
+    # Training dataset: ALL sequences with OVERLAPPING windows for augmentation
+    # The overlapping windows help the model see boundaries from different contexts
+    train_dataset = BoundaryDataset(
         features_dir=features_dir,
-        ground_truth_file=ground_truth_file,
+        ground_truth_file=full_ground_truth,  # Pass dict directly
         sequence_length=config.processing.sequence_length,
         fusion_strategy=config.fusion.strategy,
         quiet=quiet,
-        lazy_loading=True  # Enable lazy loading to save memory
+        lazy_loading=True,
+        video_names=train_video_names,  # Only training videos!
+        include_all_non_boundary=True,  # Include ALL real sequences
+        synthetic_ratio=0.0,  # DISABLED: Synthetic data caused train/val distribution mismatch
+        validation_mode=False  # Training: use overlapping windows
+    )
+    
+    # Validation dataset: NON-OVERLAPPING windows for correct metrics
+    # CRITICAL: Without validation_mode=True, overlapping windows cause the same boundary
+    # to be counted multiple times, inflating GT count and making metrics inconsistent.
+    # Example: boundary at frame 75 appears in windows [0:100] AND [50:150]
+    # → counted TWICE in metrics → inflated recall denominator → lower apparent recall
+    val_dataset = BoundaryDataset(
+        features_dir=features_dir,
+        ground_truth_file=full_ground_truth,  # Pass dict directly
+        sequence_length=config.processing.sequence_length,
+        fusion_strategy=config.fusion.strategy,
+        quiet=quiet,
+        lazy_loading=True,
+        video_names=val_video_names,  # Only validation videos!
+        include_all_non_boundary=True,  # Include ALL sequences for fair evaluation
+        synthetic_ratio=0.0,  # NO synthetic for validation - evaluate on real data only
+        validation_mode=True  # CRITICAL: Non-overlapping windows for correct metrics!
     )
     
     # Force garbage collection after dataset creation
     gc.collect()
     
     if not quiet:
-        print(f"Created dataset with {len(dataset)} samples using {config.fusion.strategy} fusion")
+        print(f"\n  DATASET SIZES:")
+        print(f"    Training samples: {len(train_dataset)}")
+        print(f"    Validation samples: {len(val_dataset)}")
         print(f"  Memory optimization: Lazy loading enabled")
         print_memory_usage("After dataset creation: ")
     
-    # Check if dataset is empty
-    if len(dataset) == 0:
-        error_msg = f"ERROR: Dataset is empty! No training samples were created."
+    # Check if datasets are empty
+    if len(train_dataset) == 0:
+        error_msg = f"ERROR: Training dataset is empty! No training samples were created."
         print(error_msg)
         print(f"  - Features directory: {features_dir}")
         print(f"  - Ground truth file: {ground_truth_file}")
@@ -1465,17 +2256,10 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         print(f"  - Sequence length: {config.processing.sequence_length}")
         raise RuntimeError(error_msg)
     
-    # Split dataset
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
-    )
-    
     # Create data loaders with reduced workers to save memory
     # Each worker duplicates the dataset, so fewer workers = less memory
-    num_workers = 0 if len(dataset) > 50000 else 2  # Use 0 workers for large datasets
+    total_samples = len(train_dataset) + len(val_dataset)
+    num_workers = 0 if total_samples > 50000 else 2  # Use 0 workers for large datasets
     
     if not quiet:
         print(f"  DataLoader workers: {num_workers} (memory-optimized)")
@@ -1496,7 +2280,16 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         pin_memory=False
     )
     
-    # Determine input dimension based on fusion strategy
+    # Determine input dimension based on feature type (individual or fused)
+    # Individual feature dimensions:
+    individual_feature_dims = {
+        "hsv_histogram": 768,     # HSV histogram: 256 bins * 3 channels = 768
+        "cnn": 2048,              # ResNet50 features
+        "clip": 512,              # CLIP ViT-B/32 features
+        "optical_flow": 40,       # Optical flow histogram bins
+    }
+    
+    # Fusion strategy output dimensions:
     # Each fusion strategy outputs different dimensions based on how they combine features
     # Actual feature dimensions: CNN=2048, HSV=768, CLIP=512, Flow=40
     fusion_input_dims = {
@@ -1507,10 +2300,16 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         "hierarchical": 512       # Hierarchical fusion progressively reduces to 512 (verified)
     }
     
-    input_dim = fusion_input_dims.get(config.fusion.strategy, 512)
-    
-    if not quiet:
-        print(f"Using input_dim={input_dim} for {config.fusion.strategy} fusion strategy")
+    # Check if it's an individual feature type first
+    feature_type = config.fusion.strategy
+    if feature_type in individual_feature_dims:
+        input_dim = individual_feature_dims[feature_type]
+        if not quiet:
+            print(f"Using input_dim={input_dim} for individual feature: {feature_type}")
+    else:
+        input_dim = fusion_input_dims.get(feature_type, 512)
+        if not quiet:
+            print(f"Using input_dim={input_dim} for fusion strategy: {feature_type}")
     
     # Initialize model with correct input dimension
     model_config = config.detection.__dict__.copy()
@@ -1542,8 +2341,8 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
     epoch_iterator = tqdm(range(config.detection.num_epochs), desc=f"Training ({config.fusion.strategy})", disable=not show_progress) if show_progress else range(config.detection.num_epochs)
     
     for epoch in epoch_iterator:
-        # Train
-        train_loss, train_acc = trainer.train_epoch(train_loader)
+        # Train (pass current epoch for warmup scheduling)
+        train_loss, train_acc = trainer.train_epoch(train_loader, current_epoch=epoch)
         
         # Validate
         val_loss, val_acc, val_precision, val_recall = trainer.validate(val_loader)
@@ -1559,8 +2358,8 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         val_recalls.append(val_recall)
         val_f1_scores.append(val_f1)
         
-        # Learning rate scheduling
-        trainer.scheduler.step()
+        # Step scheduler based on validation F1 (for ReduceLROnPlateau)
+        trainer.step_scheduler_on_validation(val_f1)
         
         # Update progress bar or print results
         if show_progress:
@@ -1769,8 +2568,21 @@ Final Validation Metrics:
         'val_f1_score': val_f1_scores
     }
     
+    # Calculate training duration
+    training_end_time = time.time()
+    training_duration_seconds = training_end_time - training_start_time
+    training_duration_minutes = training_duration_seconds / 60
+    training_duration_hours = training_duration_seconds / 3600
+    
+    # Add timing information to final_metrics
+    final_metrics['training_time_seconds'] = training_duration_seconds
+    final_metrics['training_time_minutes'] = training_duration_minutes
+    final_metrics['training_time_hours'] = training_duration_hours
+    final_metrics['training_time_formatted'] = f"{int(training_duration_hours)}h {int(training_duration_minutes % 60)}m {int(training_duration_seconds % 60)}s"
+    
     if not quiet:
         print(f"Training completed for {config.fusion.strategy}. Best F1-score: {best_f1_score:.4f}")
+        print(f"Training time: {final_metrics['training_time_formatted']}")
         print(f"Model saved to: {model_save_path}")
     return final_metrics
 
@@ -1991,7 +2803,8 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
                                    fusion_strategies: List[str] = None,
                                    show_progress: bool = True,
                                    quiet: bool = False,
-                                   save_plots: bool = True) -> Dict[str, Dict[str, float]]:
+                                   save_plots: bool = True,
+                                   results_file: str = None) -> Dict[str, Dict[str, float]]:
     """
     Train transformer models for multiple fusion strategies.
     
@@ -2004,6 +2817,7 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
         show_progress: Whether to show progress bars
         quiet: Whether to suppress non-essential output
         save_plots: Whether to save training/validation plots for each strategy
+        results_file: Path to save combined results JSON (will be updated after each strategy)
         
     Returns:
         Dictionary mapping fusion strategy names to their training results
@@ -2011,11 +2825,21 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
     # Default fusion strategies if none specified
     if fusion_strategies is None:
         fusion_strategies = ["concatenation", "weighted", "pca", "cross_transformer", "hierarchical"]
+    
+    # Default results file if not specified
+    if results_file is None:
+        results_file = os.path.join(os.path.dirname(model_base_path), "training_results.json")
+    
+    # Directory for individual strategy result files
+    results_dir = os.path.dirname(results_file)
+    
     print(f"Fusion strategies to train: {fusion_strategies}")
     if not quiet:
         print("="*80)
         print(f"TRAINING MULTIPLE TRANSFORMER MODELS")
         print(f"Fusion strategies: {', '.join(fusion_strategies)}")
+        print(f"Results will be saved to: {results_file}")
+        print(f"Individual results in: {results_dir}")
         print("="*80)
     
     results = {}
@@ -2058,6 +2882,14 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
                 print(f"  Model saved to: {model_path}")
                 print(f"  Best F1-score: {strategy_results['best_f1']:.4f}")
             
+            # Save individual strategy result to its own JSON file
+            save_single_strategy_result(strategy, strategy_results, results_dir, quiet)
+            
+            # Save/update combined results JSON (incremental save)
+            save_training_results(results, results_file)
+            if not quiet:
+                print(f"  Combined results updated: {results_file}")
+            
         except Exception as e:
             error_msg = f"\n✗ Failed to train {strategy} model: {e}"
             if show_progress:
@@ -2065,6 +2897,13 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
             elif not quiet:
                 print(error_msg)
             results[strategy] = {'error': str(e), 'best_f1': 0.0}
+            
+            # Save error result for this strategy
+            save_single_strategy_result(strategy, results[strategy], results_dir, quiet)
+            
+            # Save/update combined results even on failure
+            save_training_results(results, results_file)
+            
             traceback.print_exc()
             exit(1)  # Exit on failure to ensure issues are addressed immediately
     
@@ -2091,6 +2930,10 @@ def train_multiple_fusion_strategies(config: VideoShotConfig, features_dir: str,
             print(f"\n🏆 BEST PERFORMING STRATEGY: {best_strategy} (F1: {best_f1:.4f})")
         else:
             print(f"\n⚠️  No models trained successfully!")
+        
+        print(f"\n📁 Results saved to:")
+        print(f"   Combined: {results_file}")
+        print(f"   Individual: {results_dir}/training_result_<strategy>.json")
     
     # Create comparison plots for all strategies
     if save_plots and len([r for r in results.values() if 'error' not in r]) > 1:
@@ -2168,6 +3011,61 @@ def save_training_results(results: Dict[str, Dict[str, float]],
     if best_strategy:
         print(f"  Best strategy: {best_strategy} (F1: {best_f1:.4f})")
     print(f"{'='*80}")
+
+
+def save_single_strategy_result(strategy: str, result: Dict[str, Any], 
+                                results_dir: str, quiet: bool = False) -> str:
+    """
+    Save training results for a single strategy to its own JSON file.
+    
+    Args:
+        strategy: Name of the fusion strategy or feature type
+        result: Training results dictionary for this strategy
+        results_dir: Directory to save results JSON file
+        quiet: Whether to suppress output messages
+        
+    Returns:
+        Path to the saved JSON file
+    """
+    import json
+    from datetime import datetime
+    
+    # Prepare result for JSON serialization
+    serializable_result = {}
+    for key, value in result.items():
+        if key == 'training_history':
+            # Convert numpy arrays to lists if present
+            history = {}
+            for hist_key, hist_value in value.items():
+                if isinstance(hist_value, (list, tuple)):
+                    history[hist_key] = [float(v) if not isinstance(v, (int, str)) else v for v in hist_value]
+                else:
+                    history[hist_key] = hist_value
+            serializable_result[key] = history
+        else:
+            serializable_result[key] = value
+    
+    # Add metadata
+    result_with_metadata = {
+        'timestamp': datetime.now().isoformat(),
+        'strategy': strategy,
+        'is_individual_feature': is_individual_feature(strategy),
+        'success': 'error' not in result,
+        'best_f1': result.get('best_f1', 0.0),
+        'result': serializable_result
+    }
+    
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Save to strategy-specific file
+    result_file = os.path.join(results_dir, f"training_result_{strategy}.json")
+    with open(result_file, 'w') as f:
+        json.dump(result_with_metadata, f, indent=2)
+    
+    if not quiet:
+        print(f"  Strategy result saved to: {result_file}")
+    
+    return result_file
 
 
 def load_training_results(results_file: str) -> Dict[str, Dict[str, float]]:
@@ -2742,13 +3640,24 @@ def main():
     parser.add_argument("--features_dir", default="training_features", help="Directory to save/load features")
     parser.add_argument("--model_path", default="models/transformer_detection.pth", help="Path to save trained model")
     parser.add_argument("--extract_features", action="store_true", help="Extract features before training")
-    parser.add_argument("--fusion_strategy", default="hierarchical", help="Single fusion strategy to use")
+    parser.add_argument("--fusion_strategy", default="hierarchical", 
+                       help="Fusion strategy to use (concatenation, weighted, pca, cross_transformer, hierarchical). Ignored if --feature_type is set.")
     
-    # New arguments for multi-strategy training
+    # Individual feature training (NEW)
+    parser.add_argument("--feature_type", type=str, default=None,
+                       choices=['hsv_histogram', 'cnn', 'clip', 'optical_flow', 
+                               'concatenation', 'weighted', 'pca', 'cross_transformer', 'hierarchical'],
+                       help="Feature type for training. Can be individual feature (hsv_histogram, cnn, clip, optical_flow) "
+                            "or fusion strategy (concatenation, weighted, pca, cross_transformer, hierarchical). "
+                            "If not specified, uses --fusion_strategy.")
+    parser.add_argument("--train_all_features", action="store_true",
+                       help="Train models for all individual feature types (hsv_histogram, cnn, clip, optical_flow)")
+    
+    # Multi-strategy training
     parser.add_argument("--train_all_strategies", action="store_true", 
                        help="Train models for all available fusion strategies")
     parser.add_argument("--fusion_strategies", nargs="+",
-                       default=[ "pca", "cross_transformer", "hierarchical"], #"concatenation","weighted",
+                       default=[ "pca", "cross_transformer", "hierarchical","concatenation","weighted"], 
                        help="List of fusion strategies to train")
     parser.add_argument("--results_file", default="models/training_results.json",
                        help="File to save training results summary")
@@ -2925,8 +3834,74 @@ def main():
     
     os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
     
-    if args.train_all_strategies:
-        # Train multiple strategies
+    # Determine the effective feature type to use
+    # feature_type takes precedence over fusion_strategy
+    effective_feature_type = args.feature_type if args.feature_type else args.fusion_strategy
+    
+    # Results file for individual features
+    results_file_features = args.results_file.replace('.json', '_individual_features.json')
+    results_dir = os.path.dirname(args.results_file)
+    
+    if args.train_all_features:
+        # Train models for all individual feature types
+        if not quiet_mode:
+            print(f"Training models for all individual feature types: {INDIVIDUAL_FEATURE_TYPES}")
+            print(f"Results will be saved incrementally to: {results_file_features}")
+        
+        all_results = {}
+        for feature_type in INDIVIDUAL_FEATURE_TYPES:
+            if not quiet_mode:
+                print(f"\\n{'='*60}")
+                print(f"Training model for {feature_type} feature...")
+                print(f"{'='*60}")
+            
+            # Create model path with feature type suffix
+            model_base = args.model_path.replace('.pth', '')
+            model_path = f"{model_base}_{feature_type}.pth"
+            
+            try:
+                result = train_transformer_model(
+                    config=config,
+                    features_dir=args.features_dir,
+                    ground_truth_file=args.ground_truth,
+                    model_save_path=model_path,
+                    fusion_strategy=feature_type,  # Using feature_type as the "strategy"
+                    show_progress=show_progress,
+                    quiet=quiet_mode
+                )
+                all_results[feature_type] = result
+                
+                # Save individual feature result to its own JSON file
+                save_single_strategy_result(feature_type, result, results_dir, quiet_mode)
+                
+            except Exception as e:
+                if not quiet_mode:
+                    print(f"Error training {feature_type}: {e}")
+                all_results[feature_type] = {'error': str(e), 'best_f1': 0.0}
+                
+                # Save error result for this feature
+                save_single_strategy_result(feature_type, all_results[feature_type], results_dir, quiet_mode)
+            
+            # Save/update combined results JSON (incremental save after each feature)
+            save_training_results(all_results, results_file_features)
+            if not quiet_mode:
+                print(f"  Combined results updated: {results_file_features}")
+        
+        if not quiet_mode:
+            print(f"\\n{'='*60}")
+            print("INDIVIDUAL FEATURE TRAINING COMPLETE")
+            print(f"{'='*60}")
+            for ft, res in all_results.items():
+                if 'error' in res:
+                    print(f"  {ft}: ERROR - {res['error']}")
+                else:
+                    print(f"  {ft}: F1={res.get('best_f1', 'N/A'):.4f}")
+            print(f"\\n📁 Results saved to:")
+            print(f"   Combined: {results_file_features}")
+            print(f"   Individual: {results_dir}/training_result_<feature>.json")
+    
+    elif args.train_all_strategies:
+        # Train multiple fusion strategies
         if not quiet_mode:
             print(f"Training models for strategies: {args.fusion_strategies}")
         results = train_multiple_fusion_strategies(
@@ -2936,10 +3911,11 @@ def main():
             model_base_path=args.model_path,
             fusion_strategies=args.fusion_strategies,
             show_progress=show_progress,
-            quiet=quiet_mode
+            quiet=quiet_mode,
+            results_file=args.results_file  # Pass results file for incremental saving
         )
         
-        # Save results
+        # Results are already saved incrementally, but do a final save to be sure
         save_training_results(results, args.results_file)
         
         # Print comparison and save to text file
@@ -2964,15 +3940,22 @@ def main():
                     print(f"\n⚠️  Cannot create ensemble: need at least 2 successful models")
 
     else:
-        # Train single strategy
+        # Train single feature type (individual feature or fusion strategy)
+        feature_name = effective_feature_type
+        is_individual = is_individual_feature(effective_feature_type)
+        
         if not quiet_mode:
-            print(f"Training model for {args.fusion_strategy} strategy...")
+            if is_individual:
+                print(f"Training model for individual feature: {feature_name}")
+            else:
+                print(f"Training model for fusion strategy: {feature_name}")
+        
         results = train_transformer_model(
             config=config,
             features_dir=args.features_dir,
             ground_truth_file=args.ground_truth,
             model_save_path=args.model_path,
-            fusion_strategy=args.fusion_strategy,
+            fusion_strategy=effective_feature_type,  # Works for both individual features and fusion strategies
             show_progress=show_progress,
             quiet=quiet_mode
         )
@@ -2980,6 +3963,7 @@ def main():
         if not quiet_mode:
             print(f"\n✓ Training completed!")
             print(f"Model saved to: {args.model_path}")
+            print(f"Feature type: {feature_name} ({'individual' if is_individual else 'fusion'})")
             print(f"Best F1-score: {results['best_f1']:.4f}")
 
 

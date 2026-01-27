@@ -47,15 +47,24 @@ class CNNFeatureExtractor(BaseFeatureExtractor):
         
     def initialize(self) -> None:
         """Initialize the CNN model and preprocessing."""
-        # Load the model
+        # Load the model with new weights API
         if self.model_name == "resnet50":
-            self.model = models.resnet50(pretrained=self.pretrained)
+            if self.pretrained:
+                self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            else:
+                self.model = models.resnet50(weights=None)
             self._feature_dim = 2048
         elif self.model_name == "resnet101":
-            self.model = models.resnet101(pretrained=self.pretrained)
+            if self.pretrained:
+                self.model = models.resnet101(weights=models.ResNet101_Weights.IMAGENET1K_V1)
+            else:
+                self.model = models.resnet101(weights=None)
             self._feature_dim = 2048
         elif self.model_name == "efficientnet_b0":
-            self.model = models.efficientnet_b0(pretrained=self.pretrained)
+            if self.pretrained:
+                self.model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            else:
+                self.model = models.efficientnet_b0(weights=None)
             self._feature_dim = 1280
         else:
             raise ValueError(f"Unsupported model: {self.model_name}")

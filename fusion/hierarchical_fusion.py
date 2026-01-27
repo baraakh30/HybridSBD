@@ -138,8 +138,10 @@ class HierarchicalFusion(BaseFusionStrategy):
                 # Fallback if CLIP features not available
                 final_output = level2_output
             
-            # Normalize final output
-            final_output = F.normalize(final_output, p=2, dim=1)
+            # NOTE: L2 normalization REMOVED to preserve magnitude information
+            # The boundary detector relies on frame-to-frame magnitude differences
+            # Normalizing can reduce the discriminative power of frame differences
+            # final_output = F.normalize(final_output, p=2, dim=1)  # DISABLED
             
             return final_output.cpu().numpy()
     

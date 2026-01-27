@@ -152,5 +152,175 @@ def test_focal_loss():
     print("\n✅ All losses computed successfully!")
 
 
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss - Generalization of Dice Loss with controllable FP/FN weighting.
+    
+    Tversky Index = TP / (TP + alpha*FP + beta*FN)
+    
+    - alpha=beta=0.5 → Dice Loss (F1)
+    - alpha < beta → Penalize FN more (improve Recall)
+    - alpha > beta → Penalize FP more (improve Precision)
+    
+    Paper: "Tversky loss function for image segmentation" (Salehi et al., 2017)
+    """
+    
+    def __init__(self, alpha: float = 0.3, beta: float = 0.7, smooth: float = 1e-6):
+        """
+        Initialize Tversky Loss.
+        
+        Args:
+            alpha: Weight for False Positives (lower = tolerate more FP)
+            beta: Weight for False Negatives (higher = penalize FN more = better recall)
+            smooth: Smoothing factor to avoid division by zero
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Tversky loss.
+        
+        Args:
+            logits: Raw model outputs (before sigmoid)
+            targets: Binary targets (0 or 1)
+            
+        Returns:
+            Loss value (1 - Tversky Index)
+        """
+        probs = torch.sigmoid(logits).view(-1)
+        targets = targets.view(-1)
+        
+        # True Positives, False Positives, False Negatives
+        tp = (probs * targets).sum()
+        fp = (probs * (1 - targets)).sum()
+        fn = ((1 - probs) * targets).sum()
+        
+        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        
+        return 1 - tversky_index
+
+
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss - Combines Tversky with focal mechanism for hard examples.
+    
+    Loss = (1 - Tversky)^gamma
+    
+    Higher gamma focuses more on hard examples with low Tversky scores.
+    """
+    
+    def __init__(self, alpha: float = 0.3, beta: float = 0.7, gamma: float = 1.5, smooth: float = 1e-6):
+        """
+        Initialize Focal Tversky Loss.
+        
+        Args:
+            alpha: Weight for False Positives
+            beta: Weight for False Negatives  
+            gamma: Focal parameter (higher = more focus on hard samples)
+            smooth: Smoothing factor
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits).view(-1)
+        targets = targets.view(-1)
+        
+        tp = (probs * targets).sum()
+        fp = (probs * (1 - targets)).sum()
+        fn = ((1 - probs) * targets).sum()
+        
+        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        
+        # Focal component: raise to power gamma
+        focal_tversky = (1 - tversky_index) ** self.gamma
+        
+        return focal_tversky
+
+
+class SoftF1Loss(nn.Module):
+    """
+    Soft F1 Loss - Directly optimizes the F1 score in a differentiable manner.
+    
+    This is the most direct way to optimize F1!
+    
+    Soft F1 = 2*TP / (2*TP + FP + FN)
+    Loss = 1 - Soft F1
+    """
+    
+    def __init__(self, smooth: float = 1e-6):
+        super().__init__()
+        self.smooth = smooth
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits).view(-1)
+        targets = targets.view(-1)
+        
+        # Apply label smoothing to prevent overconfidence
+        # This helps generalization by making the model less certain
+        label_smoothing = 0.05
+        targets = targets * (1 - label_smoothing) + 0.5 * label_smoothing
+        
+        tp = (probs * targets).sum()
+        fp = (probs * (1 - targets)).sum()
+        fn = ((1 - probs) * targets).sum()
+        
+        soft_f1 = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
+        
+        return 1 - soft_f1
+
+
+class ComboLossV2(nn.Module):
+    """
+    Enhanced Combo Loss: Focal + Tversky + Soft F1
+    
+    Combines:
+    - Focal Loss: Handles class imbalance + hard examples
+    - Tversky Loss: Controllable precision/recall trade-off
+    - Soft F1 Loss: Direct F1 optimization
+    """
+    
+    def __init__(self, focal_alpha: float = 0.75, focal_gamma: float = 2.0,
+                 tversky_alpha: float = 0.3, tversky_beta: float = 0.7,
+                 focal_weight: float = 0.3, tversky_weight: float = 0.3, f1_weight: float = 0.4):
+        """
+        Initialize ComboLossV2.
+        
+        Args:
+            focal_alpha, focal_gamma: Focal loss parameters
+            tversky_alpha, tversky_beta: Tversky loss parameters
+            focal_weight: Weight for focal loss component
+            tversky_weight: Weight for tversky loss component
+            f1_weight: Weight for soft F1 loss component (MAIN COMPONENT)
+        """
+        super().__init__()
+        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.tversky_loss = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
+        self.soft_f1_loss = SoftF1Loss()
+        
+        self.focal_weight = focal_weight
+        self.tversky_weight = tversky_weight
+        self.f1_weight = f1_weight
+        
+        # Normalize weights
+        total = focal_weight + tversky_weight + f1_weight
+        self.focal_weight /= total
+        self.tversky_weight /= total
+        self.f1_weight /= total
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        focal = self.focal_loss(logits, targets)
+        tversky = self.tversky_loss(logits, targets)
+        soft_f1 = self.soft_f1_loss(logits, targets)
+        
+        return self.focal_weight * focal + self.tversky_weight * tversky + self.f1_weight * soft_f1
+
+
 if __name__ == "__main__":
     test_focal_loss()

@@ -7,8 +7,12 @@ It configures environment variables to handle problematic video files.
 import os
 import sys
 
-def configure_opencv():
+# Flag to track if we've already printed config messages
+_OPENCV_CONFIG_LOGGED = False
+
+def configure_opencv(verbose: bool = False):
     """Configure OpenCV environment variables for better video handling."""
+    global _OPENCV_CONFIG_LOGGED
     
     # Set OpenCV FFmpeg options for better video compatibility
     env_vars = {
@@ -23,12 +27,14 @@ def configure_opencv():
     for key, value in env_vars.items():
         if key not in os.environ:
             os.environ[key] = value
-            print(f"Set {key}={value}")
-        else:
-            print(f"{key} already set to: {os.environ[key]}")
+            if verbose and not _OPENCV_CONFIG_LOGGED:
+                print(f"Set {key}={value}")
+        # Don't print "already set" messages - they're just noise
+    
+    _OPENCV_CONFIG_LOGGED = True
 
-# Configure immediately when module is imported
-configure_opencv()
+# Configure immediately when module is imported (silently)
+configure_opencv(verbose=False)
 
 # Force environment variable verification
 def verify_opencv_config():
@@ -37,10 +43,8 @@ def verify_opencv_config():
     current_attempts = os.environ.get('OPENCV_FFMPEG_READ_ATTEMPTS', 'NOT_SET')
     
     if current_attempts != expected_attempts:
-        print(f"WARNING: OPENCV_FFMPEG_READ_ATTEMPTS is {current_attempts}, expected {expected_attempts}")
-        # Force set it again
+        # Force set it again (silently)
         os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = expected_attempts
-        print(f"Force set OPENCV_FFMPEG_READ_ATTEMPTS to {expected_attempts}")
     
     return current_attempts == expected_attempts
 

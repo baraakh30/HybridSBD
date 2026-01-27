@@ -424,7 +424,7 @@ class ProcessingCoordinator:
         Returns:
             Dictionary mapping feature names to feature arrays
         """
-        self.logger.info('using device:', self.config.processing.device)
+        self.logger.info(f'using device: {self.config.processing.device}')
         if parallel and len(self.feature_extractors) > 1:
             return self._extract_all_features_parallel(frames, max_workers)
         

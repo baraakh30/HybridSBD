@@ -1,4 +1,7 @@
 venv/
+.venv/
+.vscode/
+__pycache__/
 test_results/
 __pycache__/
 *.pyc

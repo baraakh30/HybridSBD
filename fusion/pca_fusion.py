@@ -143,8 +143,8 @@ class PCAFusion(BaseFusionStrategy):
             # Transform using the fitted PCA
             reduced_features = self.pca.transform(standardized_features)
             
-            print(f"PCA auto-fitted: {self.n_components} components (adjusted) retain "
-                  f"{np.sum(self.pca.explained_variance_ratio_):.3f} variance")
+            # print(f"PCA auto-fitted: {self.n_components} components (adjusted) retain "
+            #       f"{np.sum(self.pca.explained_variance_ratio_):.3f} variance")
         else:
             # Use already fitted PCA
             standardized_features = self.scaler.transform(concatenated_features)
