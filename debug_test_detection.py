@@ -8,7 +8,7 @@ from core.config import VideoShotConfig
 
 # Load one video's features and GT
 video_name = '1t9hqz2sqqc'
-features = np.load(f'testing_features/{video_name}_pca.npy')
+features = np.load(f'testing_features/{video_name}_concatenation.npy')
 print(f'Features shape: {features.shape}')
 
 # Load GT
@@ -28,7 +28,7 @@ for i in range(1, len(boundaries)):
 
 # Load model and detect
 config = VideoShotConfig()
-detection = load_model('models/transformer_detection_pca.pth', 'pca', config)
+detection = load_model('models/transformer_detection_concatenation.pth', 'concatenation', config)
 print(f'\nModel settings:')
 print(f'  confidence_threshold: {detection.confidence_threshold}')
 print(f'  use_nms: {detection.use_nms}')
@@ -78,7 +78,7 @@ from importlib import reload
 import detection.transformer_detection as td
 reload(td)
 from test_transformer_models import load_model
-detection = load_model('models/transformer_detection_pca.pth', 'pca', config)
+detection = load_model('models/transformer_detection_concatenation.pth', 'concatenation', config)
 
 # Run detection to get probs
 detected = detection.detect_boundaries(features)

@@ -94,7 +94,7 @@ class DetectionConfig:
     early_stopping_patience: int = 10
     
     # Loss function configuration
-    loss_type: str = "combo_v2"  # "focal" or "bce" - USE BCE for now, it's simpler and more stable
+    loss_type: str = "multi_task"  # "focal" or "bce" - USE BCE for now, it's simpler and more stable
     focal_alpha: float = 0.25  # For focal loss: balanced (if you switch back to focal)
     focal_gamma: float = 2.0   # For focal loss: focusing parameter
     # class_weights: Dict[str, float] = field(default_factory=lambda: {"negative": 1.0, "positive": 30.0})  # Balanced weight for 1:85 imbalance

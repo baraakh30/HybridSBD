@@ -61,18 +61,19 @@ DEFAULT_MODEL_DIR = "models"
 DEFAULT_RESULTS_DIR = "test_results"
 
 
-def load_ground_truth(ground_truth_file: str) -> Dict[str, List[int]]:
+def load_ground_truth(ground_truth_file: str, return_ranges: bool = False) -> Dict[str, List]:
     """
     Load ground truth annotations from JSON file.
     
     Handles ClipShots format: {'video.mp4': {'transitions': [[start, end], ...], 'frame_num': N}}
-    Converts to: {'video_name': [boundary_frame1, boundary_frame2, ...]}
     
     Args:
         ground_truth_file: Path to ground truth JSON file
+        return_ranges: If True, return transition ranges [(start, end), ...]
+                      If False (default), return boundary frames [end_frame, ...] for backward compat
         
     Returns:
-        Dictionary mapping video names (without .mp4) to list of boundary frames
+        Dictionary mapping video names (without .mp4) to list of boundary frames or transition ranges
     """
     with open(ground_truth_file, 'r') as f:
         data = json.load(f)
@@ -86,17 +87,30 @@ def load_ground_truth(ground_truth_file: str) -> Dict[str, List[int]]:
         # Extract boundaries from transitions
         # Handle both old format (list of boundaries) and new format (dict with transitions)
         if isinstance(video_data, dict) and 'transitions' in video_data:
-            # ClipShots format: extract the END frame of each transition as the boundary
-            # transitions = [[start, end], ...] where end is the first frame of new shot
-            boundaries = [transition[1] for transition in video_data['transitions']]
+            # ClipShots format: transitions = [[start, end], ...]
+            # Filter invalid transitions (start >= end, negative values)
+            valid_transitions = []
+            for t in video_data['transitions']:
+                if len(t) >= 2:
+                    start_frame, end_frame = int(t[0]), int(t[1])
+                    if start_frame >= 0 and end_frame > start_frame:
+                        valid_transitions.append((start_frame, end_frame))
+            
+            if return_ranges:
+                processed[video_name_stem] = valid_transitions
+            else:
+                # Backward compatibility: return end frames only
+                processed[video_name_stem] = [t[1] for t in valid_transitions]
         elif isinstance(video_data, list):
             # Old format: direct list of boundaries
-            boundaries = video_data
+            if return_ranges:
+                # Convert single frames to (frame, frame) ranges
+                processed[video_name_stem] = [(int(b), int(b)) for b in video_data if int(b) >= 0]
+            else:
+                processed[video_name_stem] = [int(b) for b in video_data if int(b) >= 0]
         else:
             # Unknown format, skip
             continue
-        
-        processed[video_name_stem] = boundaries
     
     return processed
 
@@ -321,26 +335,32 @@ def get_available_models(model_dir: str) -> Dict[str, str]:
     return available
 
 
-def calculate_metrics(detected: List[int], ground_truth: List[int], 
+def calculate_metrics(detected: List[int], ground_truth, 
                      tolerance: int = 3) -> Dict[str, float]:
     """
     Calculate detection metrics with tolerance using standard SBD protocol.
     
-    Standard SBD evaluation protocol (used in TransNetV2, ClipShots, etc.):
-    - Each GT boundary can match at most ONE prediction (closest within tolerance)
-    - Each prediction can match at most ONE GT boundary
-    - Greedy matching: process GT boundaries and find closest unmatched prediction
+    CRITICAL FIX: Supports transition RANGES [(start, end), ...] not just end frames.
+    A prediction is a TP if it falls within ANY transition range (with tolerance).
+    This is the ClipShots evaluation protocol for gradual transitions.
+    
+    Standard SBD evaluation protocol:
+    - Each GT transition can match at most ONE prediction
+    - Each prediction can match at most ONE GT transition
+    - A prediction matches if it's within [start-tolerance, end+tolerance] of a transition
     
     Args:
         detected: List of detected boundary frames
-        ground_truth: List of ground truth boundary frames
-        tolerance: Tolerance window for matching (frames) - default 3 to match training
+        ground_truth: List of ground truth - can be either:
+                     - List[int]: boundary frames (legacy)
+                     - List[Tuple[int, int]]: transition ranges (start, end)
+        tolerance: Tolerance window for matching (frames) - default 3
         
     Returns:
         Dictionary with precision, recall, f1_score
     """
+    # Convert ground_truth to ranges if not already
     if not ground_truth:
-        # No ground truth boundaries
         return {
             'precision': 1.0 if not detected else 0.0,
             'recall': 1.0,
@@ -350,6 +370,14 @@ def calculate_metrics(detected: List[int], ground_truth: List[int],
             'false_negatives': 0
         }
     
+    # Check if ground_truth contains ranges or single frames
+    gt_ranges = []
+    for gt in ground_truth:
+        if isinstance(gt, (list, tuple)) and len(gt) >= 2:
+            gt_ranges.append((int(gt[0]), int(gt[1])))
+        else:
+            gt_ranges.append((int(gt), int(gt)))  # Single frame = instant cut
+    
     if not detected:
         return {
             'precision': 0.0,
@@ -357,39 +385,50 @@ def calculate_metrics(detected: List[int], ground_truth: List[int],
             'f1_score': 0.0,
             'true_positives': 0,
             'false_positives': 0,
-            'false_negatives': len(ground_truth)
+            'false_negatives': len(gt_ranges)
         }
     
-    # ONE-TO-ONE MATCHING (standard SBD protocol)
-    # Each GT matches at most one prediction, each prediction matches at most one GT
+    # ONE-TO-ONE MATCHING with OVERLAP detection
+    # Each GT transition matches at most one prediction, each prediction matches at most one GT
     matched_pred = set()
     matched_gt = set()
     
-    # Sort GT by position for consistent matching (same as training)
-    for gt_idx in sorted(ground_truth):
-        # Find closest unmatched prediction within tolerance
+    # Sort GT ranges by start position for consistent matching
+    sorted_gt_indices = sorted(range(len(gt_ranges)), key=lambda i: gt_ranges[i][0])
+    
+    for gt_i in sorted_gt_indices:
+        gt_start, gt_end = gt_ranges[gt_i]
+        
+        # Find best matching prediction
+        # A prediction matches if it's within [start-tolerance, end+tolerance]
         best_pred = None
-        best_dist = tolerance + 1
+        best_score = float('inf')  # Lower is better (prefer closer to center)
         
         for pred_idx in detected:
             if pred_idx in matched_pred:
                 continue
-            dist = abs(pred_idx - gt_idx)
-            if dist <= tolerance and dist < best_dist:
-                best_dist = dist
-                best_pred = pred_idx
+            
+            # Check if prediction overlaps with transition range (with tolerance)
+            # Overlap = prediction is within extended range [start-tolerance, end+tolerance]
+            if gt_start - tolerance <= pred_idx <= gt_end + tolerance:
+                # Score by distance to center of transition (prefer predictions near center)
+                center = (gt_start + gt_end) / 2
+                score = abs(pred_idx - center)
+                if score < best_score:
+                    best_score = score
+                    best_pred = pred_idx
         
         if best_pred is not None:
             matched_pred.add(best_pred)
-            matched_gt.add(gt_idx)
+            matched_gt.add(gt_i)
     
     # Standard SBD metrics
-    true_positives = len(matched_pred)  # = len(matched_gt), matched pairs
-    false_positives = len(detected) - true_positives  # Unmatched predictions
-    false_negatives = len(ground_truth) - true_positives  # Unmatched GT boundaries
+    true_positives = len(matched_pred)
+    false_positives = len(detected) - true_positives
+    false_negatives = len(gt_ranges) - true_positives
     
     precision = true_positives / len(detected) if detected else 0.0
-    recall = true_positives / len(ground_truth) if ground_truth else 0.0
+    recall = true_positives / len(gt_ranges) if gt_ranges else 0.0
     
     if precision + recall > 0:
         f1_score = 2 * (precision * recall) / (precision + recall)
@@ -571,10 +610,11 @@ def test_all_models(model_dir: str,
     Returns:
         Dictionary with all test results
     """
-    # Load ground truth
+    # Load ground truth with TRANSITION RANGES for proper overlap-based matching
+    # This is critical for correct evaluation of gradual transitions
     print(f"Loading ground truth from: {ground_truth_file}")
-    ground_truth = load_ground_truth(ground_truth_file)
-    print(f"Ground truth loaded for {len(ground_truth)} videos")
+    ground_truth = load_ground_truth(ground_truth_file, return_ranges=True)  # CRITICAL: Use ranges!
+    print(f"Ground truth loaded for {len(ground_truth)} videos (using transition ranges)")
     
     # Get available test videos
     print(f"Scanning features directory: {features_dir}")

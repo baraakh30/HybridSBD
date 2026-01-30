@@ -862,6 +862,11 @@ class BoundaryDataset(torch.utils.data.Dataset):
     - All sequences from a video stay in the same split
     - Synthetic boundary generation for class balance
     - Uses NON-overlapping windows in validation_mode to prevent duplicate counting
+    
+    MULTI-TASK LEARNING SUPPORT:
+    - When use_multi_task=True, returns (features, class_labels, duration_labels)
+    - duration_labels: Frame-wise transition duration (0 for non-transitions, N for gradual)
+    - This teaches the model to distinguish cuts (duration=2) from gradual (duration>2)
     """
     
     def __init__(self, features_dir: str, ground_truth_file: str, 
@@ -871,7 +876,8 @@ class BoundaryDataset(torch.utils.data.Dataset):
                  include_all_non_boundary: bool = False,
                  synthetic_ratio: float = 0.5,
                  validation_mode: bool = False,
-                 feature_type: str = None):
+                 feature_type: str = None,
+                 use_multi_task: bool = False):
         """
         Initialize dataset.
         
@@ -896,23 +902,23 @@ class BoundaryDataset(torch.utils.data.Dataset):
                          - Individual feature: 'hsv_histogram', 'cnn', 'clip', 'optical_flow'
                          - Fusion strategy: 'concatenation', 'weighted', 'pca', 'cross_transformer', 'hierarchical'
                          If None, uses fusion_strategy parameter for backward compatibility.
+            use_multi_task: If True, also return duration labels for multi-task learning.
+                           Duration labels help the model learn gradual transition signatures.
         """
         self.features_dir = features_dir
         self.sequence_length = sequence_length
         self.validation_mode = validation_mode
-        # CRITICAL: In validation mode, use NON-overlapping windows (stride = sequence_length)
+        self.use_multi_task = use_multi_task  # NEW: Multi-task learning flag
+        
+        # CRITICAL: In validation mode, use NON-overlapping windows
         # This ensures each boundary is counted EXACTLY ONCE in metrics.
-        # Without this, overlapping windows cause the same boundary to be counted multiple times,
-        # inflating both GT count and prediction count, leading to inconsistent metrics.
         # 
-        # UPDATE: Use stride = sequence_length - 5 to catch boundaries at window edges
-        # A boundary at frame 99 would be at the very edge of window [0:100], making it
-        # hard to detect. With stride=95, the next window [95:195] also sees it.
+        # IMPORTANT: Use stride = sequence_length for truly non-overlapping
+        # Previous stride = sequence_length - 5 still caused some overlap issues
         if validation_mode:
-            edge_buffer = 5  # Small overlap to catch edge boundaries
-            self.overlap = sequence_length - edge_buffer  # stride = 95 for seq_len=100
+            self.overlap = sequence_length  # stride = 100 for seq_len=100 (no overlap)
             if not quiet:
-                print(f"  VALIDATION MODE: Using near-non-overlapping windows (stride={self.overlap})")
+                print(f"  VALIDATION MODE: Using non-overlapping windows (stride={self.overlap})")
         else:
             self.overlap = overlap  # Training: use overlapping windows for augmentation
         # Handle feature_type vs fusion_strategy for backward compatibility
@@ -964,6 +970,11 @@ class BoundaryDataset(torch.utils.data.Dataset):
         if self.lazy_loading:
             from functools import lru_cache
             self._feature_cache = {}
+        
+        # Print multi-task info
+        if use_multi_task and not quiet:
+            print(f"  MULTI-TASK MODE: Will return (features, class_labels, duration_labels)")
+            print(f"    Duration labels teach the model: cuts (dur=2) vs gradual (dur>2)")
     
     def _collect_feature_files(self) -> List[str]:
         """Collect all valid feature files from the dataset."""
@@ -1035,14 +1046,31 @@ class BoundaryDataset(torch.utils.data.Dataset):
             # Strip .mp4 extension from video name to match feature filenames
             video_name_stem = video_name.replace('.mp4', '') if video_name.endswith('.mp4') else video_name
             
-            # Extract boundaries from transitions
+            # Extract transitions from ground truth
             # Handle both old format (list of boundaries) and new format (dict with transitions)
+            # CRITICAL FIX: Store full transition ranges [start, end] for multi-frame labeling
+            transitions = []  # List of (start_frame, end_frame) tuples
+            
             if isinstance(video_data, dict) and 'transitions' in video_data:
-                # New format: extract first frame of each transition as boundary
-                boundaries = [transition[1] for transition in video_data['transitions']]
+                # ClipShots format: transitions = [[start, end], ...]
+                # Filter out invalid transitions (start >= end, negative values, corrupted)
+                for t in video_data['transitions']:
+                    if len(t) >= 2:
+                        start_frame, end_frame = int(t[0]), int(t[1])
+                        # Validate transition: start must be < end, both must be >= 0
+                        if start_frame >= 0 and end_frame > start_frame:
+                            transitions.append((start_frame, end_frame))
+                        elif not self.quiet and start_frame >= end_frame:
+                            pass  # Silently skip invalid transitions
             elif isinstance(video_data, list):
-                # Old format: direct list of boundaries
-                boundaries = video_data
+                # Old format: direct list of single-frame boundaries
+                for boundary in video_data:
+                    if isinstance(boundary, (int, float)) and boundary >= 0:
+                        transitions.append((int(boundary), int(boundary)))  # Single frame = cut
+                    elif isinstance(boundary, (list, tuple)) and len(boundary) >= 2:
+                        start_frame, end_frame = int(boundary[0]), int(boundary[1])
+                        if start_frame >= 0 and end_frame >= start_frame:
+                            transitions.append((start_frame, max(end_frame, start_frame)))
             else:
                 if not self.quiet:
                     print(f"Warning: Unknown annotation format for {video_name}")
@@ -1119,29 +1147,39 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     videos_skipped += 1
                     continue
                 
-                # Create binary boundary labels (just metadata)
-                labels_list = []
-                for boundary in boundaries:
-                    if 0 <= boundary < num_frames - 1:
-                        labels_list.append(boundary)
+                # Store validated transitions as metadata
+                # Each transition is (start_frame, end_frame) tuple
+                # Filter transitions that are within valid frame range
+                valid_transitions = []
+                for start_frame, end_frame in transitions:
+                    if 0 <= start_frame < num_frames and 0 < end_frame <= num_frames:
+                        # Clamp to valid range
+                        valid_start = max(0, start_frame)
+                        valid_end = min(num_frames - 1, end_frame)
+                        if valid_start <= valid_end:
+                            valid_transitions.append((valid_start, valid_end))
                 
                 # Create sequence metadata only
                 for start_idx in range(0, num_frames - self.sequence_length + 1, self.overlap):
                     end_idx = start_idx + self.sequence_length
                     
-                    # Check if sequence has boundary
-                    has_boundary = any(start_idx <= b < end_idx - 1 for b in labels_list)
+                    # Check if sequence overlaps with ANY transition range
+                    # A sequence has a boundary if any transition overlaps with [start_idx, end_idx)
+                    has_boundary = any(
+                        trans_start < end_idx and trans_end >= start_idx
+                        for trans_start, trans_end in valid_transitions
+                    )
                     
-                    # BALANCED SAMPLING: Include ALL boundary sequences and subsample non-boundary
-                    # With 1:56.6 frame imbalance, this gives reasonable sequence balance
-                    # NOTE: For validation, include_all_non_boundary=True to evaluate on all data
+                    # BALANCED SAMPLING with HARD NEGATIVE MINING:
+                    # - Include ALL boundary sequences
+                    # - Subsample non-boundary sequences that are "hard negatives" (near boundaries)
                     sample_data = {
                         'video_name_stem': video_name_stem,
                         'video_name': video_name,
                         'start_frame': start_idx,
                         'end_frame': end_idx,
-                        'boundaries': labels_list,  # Store boundary positions
-                        'feature_file': strategy_file,  # Path to feature file
+                        'transitions': valid_transitions,  # Store transition ranges!
+                        'feature_file': strategy_file,
                         'num_frames': num_frames
                     }
                     
@@ -1151,11 +1189,16 @@ class BoundaryDataset(torch.utils.data.Dataset):
                         # Validation/test: include ALL sequences for fair evaluation
                         samples.append(sample_data)
                     else:
-                        # Training: subsample non-boundary using deterministic hash
-                        # This ensures reproducibility without relying on random state
+                        # Training: BALANCED SAMPLING (less aggressive than hard negative mining)
+                        # Previous hard negative mining (80%/30%) caused severe train/val mismatch
+                        # because training saw mostly "hard" cases while validation saw all cases
+                        #
+                        # New approach: Include 50% of non-boundary sequences uniformly
+                        # This maintains reasonable class balance without distribution shift
                         hash_key = f"{video_name_stem}_{start_idx}"
                         hash_val = hash(hash_key) % 100
-                        if hash_val < 50:  # 50% of non-boundary sequences (deterministic)
+                        
+                        if hash_val < 50:  # 50% of non-boundary sequences
                             samples.append(sample_data)
             else:
                 # Original behavior: load all features into memory
@@ -1168,11 +1211,23 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     videos_skipped += 1
                     continue
                 
-                # Create binary boundary labels
+                # Create CENTER-FRAME boundary labels for transitions
+                # CRITICAL FIX: Label only CENTER frame(s), not all frames
                 labels = np.zeros(len(features) - 1)
-                for boundary in boundaries:
-                    if 0 <= boundary < len(labels):
-                        labels[boundary] = 1
+                for trans_start, trans_end in transitions:
+                    # Label center frame of transition only
+                    local_start = max(0, trans_start)
+                    local_end = min(len(labels) - 1, trans_end)
+                    if local_start <= local_end:
+                        center = (local_start + local_end) // 2
+                        center = min(max(0, center), len(labels) - 1)
+                        labels[center] = 1.0
+                        # For wide transitions, also mark neighbors
+                        if local_end - local_start > 10:
+                            if center > 0:
+                                labels[center - 1] = 1.0
+                            if center < len(labels) - 1:
+                                labels[center + 1] = 1.0
                 
                 # Create sequences with full data
                 for start_idx in range(0, len(features) - self.sequence_length + 1, self.overlap):
@@ -1184,14 +1239,13 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     # Balance the dataset - include sequences with and without boundaries
                     has_boundary = np.any(sequence_labels == 1)
                     
-                    # BALANCED SAMPLING: Include ALL boundary sequences and subsample non-boundary
-                    # With 1:56.6 frame imbalance, this gives reasonable sequence balance
-                    # NOTE: For validation, include_all_non_boundary=True to evaluate on all data
+                    # Store transitions for this sequence as well
                     sample_data = {
                         'features': sequence_features,  
                         'labels': sequence_labels,
                         'video_name': video_name,
-                        'start_frame': start_idx
+                        'start_frame': start_idx,
+                        'transitions': transitions  # Keep for reference
                     }
                     
                     if has_boundary:
@@ -1227,14 +1281,26 @@ class BoundaryDataset(torch.utils.data.Dataset):
                 total_frames = 0
                 
                 if self.lazy_loading:
-                    # For lazy loading, count boundary samples and frames
+                    # For lazy loading, count boundary samples and transition frames
                     for s in samples:
-                        boundaries_in_seq = [b for b in s.get('boundaries', []) 
-                                            if s['start_frame'] <= b < s['end_frame']]
-                        if len(boundaries_in_seq) > 0:
+                        # Count frames that are within any transition range
+                        transitions = s.get('transitions', [])
+                        seq_start = s['start_frame']
+                        seq_end = s['end_frame']
+                        
+                        # Count how many frames in this sequence are transition frames
+                        boundary_frames_in_seq = 0
+                        for trans_start, trans_end in transitions:
+                            # Overlap of transition range with sequence range
+                            overlap_start = max(seq_start, trans_start)
+                            overlap_end = min(seq_end - 1, trans_end)  # -1 because labels are N-1
+                            if overlap_start <= overlap_end:
+                                boundary_frames_in_seq += (overlap_end - overlap_start + 1)
+                        
+                        if boundary_frames_in_seq > 0:
                             boundary_samples += 1
-                        total_boundary_frames += len(boundaries_in_seq)
-                        total_frames += (s['end_frame'] - s['start_frame'] - 1)  # -1 for frame pairs
+                        total_boundary_frames += boundary_frames_in_seq
+                        total_frames += (seq_end - seq_start - 1)  # -1 for frame pairs
                 else:
                     # For pre-loaded, count samples and frames with boundary label = 1
                     for s in samples:
@@ -1277,14 +1343,8 @@ class BoundaryDataset(torch.utils.data.Dataset):
             start_frame = sample['start_frame']
             end_frame = sample['end_frame']
             feature_file = sample['feature_file']
-            boundaries = sample['boundaries']
+            transitions = sample.get('transitions', [])  # List of (trans_start, trans_end) tuples
             
-            # Load only the required sequence efficiently
-            # IMPORTANT: We avoid numpy's mmap_mode on Windows because it can cause
-            # "[WinError 8] Not enough memory resources are available to process this command"
-            # This error occurs when Windows runs out of memory mapping handles (not RAM),
-            # especially with many DataLoader workers accessing files repeatedly.
-            # Solution: Direct file I/O to read only the slice we need without memory mapping.
             # Load only the required sequence efficiently
             try:
                 # Open file and seek to the specific position to load only what we need
@@ -1314,12 +1374,6 @@ class BoundaryDataset(torch.utils.data.Dataset):
                         f.seek(0)
                         features_full = np.load(f)
                         sequence_features = features_full[start_frame:end_frame].copy()
-                
-                # Synthetic augmentation DISABLED - was causing train/val distribution mismatch
-                # 30% of non-boundary sequences were being converted to synthetic boundaries,
-                # making boundaries appear ~30% more common in training than in validation.
-                # The loss function (ComboLossV2) handles class imbalance instead.
-                use_synthetic = False
                     
                 # Validate shape
                 if len(sequence_features.shape) != 2:
@@ -1344,29 +1398,66 @@ class BoundaryDataset(torch.utils.data.Dataset):
                     self._feature_dim = current_dim
                 
                 # FEATURE AUGMENTATION: Add small noise during training to improve generalization
-                # This helps the model be more robust to slight variations in features
-                if not self.validation_mode and np.random.random() < 0.5:
-                    # Add Gaussian noise with small std (1% of feature magnitude)
+                if not self.validation_mode and np.random.random() < 0.3:
                     feature_std = np.std(sequence_features) + 1e-8
                     noise = np.random.normal(0, 0.01 * feature_std, sequence_features.shape)
                     sequence_features = sequence_features + noise
                 
-                if use_synthetic:
-                    # labels = new_labels
-                    pass
-                else:
-                    # Create labels for this sequence
-                    labels = np.zeros(self.sequence_length - 1)
-                    for boundary in boundaries:
-                        if start_frame <= boundary < end_frame - 1:
-                            labels[boundary - start_frame] = 1
+                # =============================================================
+                # CREATE BINARY LABELS WITH SINGLE CENTER PEAK PER TRANSITION
+                # =============================================================
+                # CRITICAL FIX: Use BINARY labels (0/1) instead of Gaussian.
+                # Gaussian labels caused train/validation metric mismatch because:
+                # 1. Training loss operates on soft labels (0.0-1.0)
+                # 2. Metrics use threshold=0.5, so labels 0.5-1.0 are "positive"
+                # 3. Gaussian labels create MANY positive frames per transition
+                # 4. This inflates both GT count and prediction matches
+                #
+                # New approach: Label ONLY the center frame of each transition
+                # For hard cuts: single frame gets 1.0
+                # For gradual transitions: middle frame(s) get 1.0
+                # This ensures 1 GT peak per transition = clean metrics
                 
-                # Gaussian Label Smoothing DISABLED
-                # Problem: Smoothing creates soft labels (e.g., [0.2, 0.5, 1.0, 0.5, 0.2])
-                # The metric code counts labels >= 0.5 as GT, so 1 boundary → 3 GT points
-                # This inflates training TP, making train metrics look better than validation
-                # The loss function (ComboLossV2) handles soft optimization without this issue
+                labels = np.zeros(self.sequence_length - 1)
+                duration_labels = np.zeros(self.sequence_length - 1)  # NEW: Duration labels for multi-task
+                
+                for trans_start, trans_end in transitions:
+                    # Convert global frame indices to local sequence indices
+                    local_start = max(0, trans_start - start_frame)
+                    local_end = min(self.sequence_length - 2, trans_end - start_frame)
                     
+                    if local_start <= local_end and local_start < self.sequence_length - 1:
+                        # Calculate transition duration (in frames)
+                        # Duration = end - start + 1 for original global indices
+                        trans_duration = (trans_end - trans_start) + 1
+                        
+                        # For gradual transitions, label CENTER frame only
+                        # This teaches model to output a single peak
+                        trans_center = int((local_start + local_end) / 2.0)
+                        trans_center = min(max(0, trans_center), self.sequence_length - 2)
+                        
+                        # Set binary label at center
+                        labels[trans_center] = 1.0
+                        
+                        # =============================================================
+                        # MULTI-TASK: Set duration label at center frame
+                        # This teaches the model:
+                        # - Cuts: duration ≈ 1 (small log value)
+                        # - Gradual: duration 5-30+ (larger log value)
+                        # =============================================================
+                        duration_labels[trans_center] = trans_duration
+                        
+                        # For wide transitions (>10 frames), also mark ±1 neighbors
+                        # to give model some slack for precise localization
+                        trans_width = local_end - local_start
+                        if trans_width > 10:
+                            if trans_center > 0:
+                                labels[trans_center - 1] = 1.0
+                                duration_labels[trans_center - 1] = trans_duration
+                            if trans_center < self.sequence_length - 2:
+                                labels[trans_center + 1] = 1.0
+                                duration_labels[trans_center + 1] = trans_duration
+                
             except Exception as e:
                 # Handle any errors during loading
                 if not self.quiet:
@@ -1374,12 +1465,25 @@ class BoundaryDataset(torch.utils.data.Dataset):
                 # Return zero features as fallback
                 sequence_features = np.zeros((self.sequence_length, self._feature_dim or 512))
                 labels = np.zeros(self.sequence_length - 1)
+                duration_labels = np.zeros(self.sequence_length - 1)
                 
         else:
             # ORIGINAL PRE-LOADED BEHAVIOR (kept for backward compatibility)
             # Create sequences with full data
             sequence_features = sample['features']
             labels = sample['labels']
+            
+            # For pre-loaded data, create duration labels from transitions
+            duration_labels = np.zeros(len(labels))
+            if 'transitions' in sample:
+                for trans_start, trans_end in sample['transitions']:
+                    trans_duration = (trans_end - trans_start) + 1
+                    # Find where labels are positive and assign duration
+                    local_start = max(0, trans_start - sample.get('start_frame', 0))
+                    local_end = min(len(labels) - 1, trans_end - sample.get('start_frame', 0))
+                    center = (local_start + local_end) // 2
+                    if 0 <= center < len(duration_labels):
+                        duration_labels[center] = trans_duration
             
             # Pad if needed
             if sequence_features.shape[0] < self.sequence_length:
@@ -1394,6 +1498,11 @@ class BoundaryDataset(torch.utils.data.Dataset):
         features_tensor = torch.from_numpy(sequence_features).float()
         labels_tensor = torch.from_numpy(labels).float()
         
+        # MULTI-TASK: Return 3 tensors if enabled
+        if self.use_multi_task:
+            duration_tensor = torch.from_numpy(duration_labels).float()
+            return features_tensor, labels_tensor, duration_tensor
+        
         return features_tensor, labels_tensor
     
     def _get_synthetic_sample(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1404,7 +1513,7 @@ class BoundaryDataset(torch.utils.data.Dataset):
         DIFFERENT videos, teaching the model what boundaries "look like".
         
         Returns:
-            Tuple of (features_tensor, labels_tensor)
+            Tuple of (features_tensor, labels_tensor) or (features, labels, duration) if multi-task
         """
         if self._synthetic_generator is None:
             # Fallback to simple synthetic augmentation if generator not available
@@ -1419,8 +1528,13 @@ class BoundaryDataset(torch.utils.data.Dataset):
                 # Load features
                 try:
                     features = np.load(sample['feature_file'])[sample['start_frame']:sample['end_frame']]
-                    features, labels = self._synthetic_augmentation(features)
+                    features, labels, duration_labels = self._synthetic_augmentation(features)
                     labels = self._apply_gaussian_smoothing(labels)
+                    
+                    if self.use_multi_task:
+                        return (torch.from_numpy(features).float(), 
+                                torch.from_numpy(labels).float(),
+                                torch.from_numpy(duration_labels).float())
                     return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
                 except:
                     pass
@@ -1428,6 +1542,12 @@ class BoundaryDataset(torch.utils.data.Dataset):
             # Ultimate fallback: zeros
             features = np.zeros((self.sequence_length, self._feature_dim or 256))
             labels = np.zeros(self.sequence_length - 1)
+            duration_labels = np.zeros(self.sequence_length - 1)
+            
+            if self.use_multi_task:
+                return (torch.from_numpy(features).float(), 
+                        torch.from_numpy(labels).float(),
+                        torch.from_numpy(duration_labels).float())
             return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
         
         # Use the sophisticated generator for cross-video synthetic transitions
@@ -1455,14 +1575,42 @@ class BoundaryDataset(torch.utils.data.Dataset):
         # Apply Gaussian smoothing to labels
         labels = self._apply_gaussian_smoothing(labels)
         
+        # Create duration labels for synthetic samples
+        # Map transition type to approximate duration
+        duration_labels = np.zeros(self.sequence_length - 1)
+        boundary_idx = np.where(labels > 0.5)[0]
+        if len(boundary_idx) > 0:
+            # Estimate duration based on transition type
+            if transition_type == 'hard_cut':
+                synthetic_duration = 1
+            elif transition_type == 'dissolve':
+                synthetic_duration = np.random.randint(5, 20)
+            elif transition_type == 'fade':
+                synthetic_duration = np.random.randint(10, 30)
+            elif transition_type == 'wipe':
+                synthetic_duration = np.random.randint(5, 15)
+            else:
+                synthetic_duration = np.random.randint(1, 10)
+            
+            for idx in boundary_idx:
+                duration_labels[idx] = synthetic_duration
+        
+        if self.use_multi_task:
+            return (torch.from_numpy(features).float(), 
+                    torch.from_numpy(labels).float(),
+                    torch.from_numpy(duration_labels).float())
+        
         return torch.from_numpy(features).float(), torch.from_numpy(labels).float()
 
-    def _synthetic_augmentation(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _synthetic_augmentation(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Create a synthetic transition by blending two parts of the sequence.
         This simulates dissolves and wipes mathematically in feature space.
         
         Ref: TransNet V2 / AutoShot augmentation strategy
+        
+        Returns:
+            Tuple of (features, labels, duration_labels)
         """
         seq_len, dim = features.shape
         cut_point = np.random.randint(int(seq_len * 0.3), int(seq_len * 0.7))
@@ -1478,6 +1626,7 @@ class BoundaryDataset(torch.utils.data.Dataset):
         # Create transition
         result = np.zeros_like(features)
         labels = np.zeros(seq_len - 1)
+        duration_labels = np.zeros(seq_len - 1)
         
         # Linear blend (dissolve simulation)
         half_trans = transition_len // 2
@@ -1498,36 +1647,24 @@ class BoundaryDataset(torch.utils.data.Dataset):
         # Set label at the center of transition
         if 0 <= cut_point < seq_len - 1:
             labels[cut_point] = 1
+            # Duration is the transition length
+            duration_labels[cut_point] = transition_len
             
-        return result, labels
+        return result, labels, duration_labels
 
     def _apply_gaussian_smoothing(self, labels: np.ndarray, sigma: float = 1.0) -> np.ndarray:
         """
-        Apply Gaussian smoothing to binary labels.
-        Converts [0, 1, 0] -> [0.1, 0.8, 0.1]
+        DISABLED: No longer apply Gaussian smoothing.
         
-        This accounts for temporal ambiguity in soft transitions.
+        Previously this converted [0, 1, 0] -> [0.1, 0.8, 0.1]
+        But this caused train/val metric mismatch because:
+        1. Metrics use threshold 0.5 → labels 0.5-1.0 count as positive
+        2. This created MULTIPLE positive frames per boundary
+        3. Training saw inflated GT counts
+        
+        Now: Return labels unchanged (keep binary)
         """
-        if not np.any(labels == 1):
-            return labels
-            
-        smoothed = labels.copy()
-        boundary_indices = np.where(labels == 1)[0]
-        
-        for idx in boundary_indices:
-            # Wider 5-frame kernel for temporal tolerance (±2 frames)
-            # This matches the evaluation tolerance
-            if idx > 1:
-                smoothed[idx-2] = max(smoothed[idx-2], 0.2)
-            if idx > 0:
-                smoothed[idx-1] = max(smoothed[idx-1], 0.5)
-            smoothed[idx] = 1.0  # Keep peak at 1.0
-            if idx < len(labels) - 1:
-                smoothed[idx+1] = max(smoothed[idx+1], 0.5)
-            if idx < len(labels) - 2:
-                smoothed[idx+2] = max(smoothed[idx+2], 0.2)
-                
-        return smoothed
+        return labels  # Return unchanged - use binary labels
 
 
 
@@ -2203,19 +2340,24 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
     # SYNTHETIC DATA: Add mathematically generated boundaries to help balance classes
     # and teach the model what transitions "look like" in feature space.
     
+    # Determine if multi-task learning is enabled based on loss_type
+    loss_type = getattr(config.detection, "loss_type", "combo_v2")
+    use_multi_task = (loss_type == "multi_task")
+    
     # Training dataset: ALL sequences with OVERLAPPING windows for augmentation
     # The overlapping windows help the model see boundaries from different contexts
     train_dataset = BoundaryDataset(
         features_dir=features_dir,
         ground_truth_file=full_ground_truth,  # Pass dict directly
         sequence_length=config.processing.sequence_length,
-        fusion_strategy=config.fusion.strategy,
+        feature_type=config.fusion.strategy,  # CRITICAL: Pass feature_type explicitly!
         quiet=quiet,
         lazy_loading=True,
         video_names=train_video_names,  # Only training videos!
-        include_all_non_boundary=True,  # Include ALL real sequences
+        include_all_non_boundary=False,  # Use hard negative mining for training
         synthetic_ratio=0.0,  # DISABLED: Synthetic data caused train/val distribution mismatch
-        validation_mode=False  # Training: use overlapping windows
+        validation_mode=False,  # Training: use overlapping windows
+        use_multi_task=use_multi_task  # Enable duration labels for multi-task learning
     )
     
     # Validation dataset: NON-OVERLAPPING windows for correct metrics
@@ -2227,13 +2369,14 @@ def train_transformer_model(config: VideoShotConfig, features_dir: str,
         features_dir=features_dir,
         ground_truth_file=full_ground_truth,  # Pass dict directly
         sequence_length=config.processing.sequence_length,
-        fusion_strategy=config.fusion.strategy,
+        feature_type=config.fusion.strategy,  # CRITICAL: Pass feature_type explicitly!
         quiet=quiet,
         lazy_loading=True,
         video_names=val_video_names,  # Only validation videos!
         include_all_non_boundary=True,  # Include ALL sequences for fair evaluation
         synthetic_ratio=0.0,  # NO synthetic for validation - evaluate on real data only
-        validation_mode=True  # CRITICAL: Non-overlapping windows for correct metrics!
+        validation_mode=True,  # CRITICAL: Non-overlapping windows for correct metrics!
+        use_multi_task=use_multi_task  # Same multi-task mode as training
     )
     
     # Force garbage collection after dataset creation

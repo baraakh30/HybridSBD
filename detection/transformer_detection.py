@@ -89,11 +89,11 @@ class TransformerDetection(BaseDetectionMethod):
         self.num_layers = config.get("num_layers", 4)  # Reduced from 6: TCN+LSTM provide local context
         self.num_heads = config.get("num_heads", 8)
         self.ff_dim = config.get("ff_dim", 1024)  # Reduced from 2048 for efficiency
-        self.dropout = config.get("dropout", 0.15)  # Increased from 0.1 for better generalization
+        self.dropout = config.get("dropout", 0.25)  # INCREASED from 0.15 to prevent overfitting
         
         # Processing parameters
         self.sequence_length = config.get("sequence_length", 100)
-        self.confidence_threshold = config.get("confidence_threshold", 0.3)
+        self.confidence_threshold = config.get("confidence_threshold", 0.5)  # INCREASED from 0.3
         
         # SOTA Enhancement: Attention type (causal vs bidirectional)
         self.use_causal_attention = config.get("use_causal_attention", False)  # Default: bidirectional for better context
@@ -110,7 +110,7 @@ class TransformerDetection(BaseDetectionMethod):
         self.batch_size_inference = config.get("batch_size_inference", 32)
         
         # SOTA Enhancement: DropPath (Stochastic Depth) for better generalization
-        self.drop_path_rate = config.get("drop_path_rate", 0.1)
+        self.drop_path_rate = config.get("drop_path_rate", 0.2)  # INCREASED from 0.1
         
         # Model components
         self.model = None
@@ -140,7 +140,8 @@ class TransformerDetection(BaseDetectionMethod):
             use_causal_attention=self.use_causal_attention,  # Configurable!
             use_difference_features=True,
             use_magnitude_skip=True,
-            drop_path_rate=self.drop_path_rate  # Stochastic depth for generalization
+            drop_path_rate=self.drop_path_rate,  # Stochastic depth for generalization
+            use_multi_scale=True  # CRITICAL: Multi-scale for gradual transition detection
         )
         
         self.model = self.model.to(self.device)
@@ -154,7 +155,7 @@ class TransformerDetection(BaseDetectionMethod):
         
         Uses:
         - Batch inference for speed
-        - Center-frame prediction for reliability (with edge handling)
+        - FULL COVERAGE prediction (no center-only restriction) 
         - NMS peak detection for clean output
         
         Args:
@@ -167,30 +168,33 @@ class TransformerDetection(BaseDetectionMethod):
             return []
         
         # Step 1: Collect all windows for batch processing
+        # CRITICAL FIX: Use overlapping windows to ensure FULL COVERAGE
+        # Previous issue: center_ratio=0.2 with stride=20 left edge frames uncovered
         windows = []
         window_starts = []
-        is_edge_window = []  # Track which windows are edge cases
         
-        # Calculate stride based on center-frame strategy
-        if self.use_center_frame:
-            # Slide by center_ratio of sequence_length (only trust middle frames)
-            stride = max(1, int(self.sequence_length * self.center_ratio))
-        else:
-            stride = self.sequence_length // 2  # 50% overlap
+        # Use smaller stride for better coverage (50% overlap)
+        stride = max(1, self.sequence_length // 2)
         
         for start_idx in range(0, len(features) - self.sequence_length + 1, stride):
             end_idx = start_idx + self.sequence_length
             windows.append(features[start_idx:end_idx])
             window_starts.append(start_idx)
-            is_edge_window.append(False)
         
-        # Handle edge case: add final window if needed
+        # Handle edge case: ensure we cover the end of the video
         if len(features) >= self.sequence_length:
             last_start = len(features) - self.sequence_length
             if not window_starts or window_starts[-1] != last_start:
                 windows.append(features[last_start:])
                 window_starts.append(last_start)
-                is_edge_window.append(True)  # Mark as edge window
+        
+        # Handle very short videos
+        if not windows and len(features) >= 2:
+            # Pad to sequence_length
+            padded = np.zeros((self.sequence_length, features.shape[1]))
+            padded[:len(features)] = features
+            windows.append(padded)
+            window_starts.append(0)
         
         if not windows:
             return []
@@ -198,48 +202,39 @@ class TransformerDetection(BaseDetectionMethod):
         # Step 2: Batch inference
         all_probs = self._batch_predict(windows)
         
-        # Step 3: Aggregate probabilities with center-frame strategy
-        # IMPORTANT: Handle edge regions specially to ensure full coverage
+        # Step 3: Aggregate probabilities with FULL COVERAGE
+        # CRITICAL FIX: Use ALL predictions, not just center 20%
+        # This ensures edge frames (0-10, last 10) are covered
         full_probs = np.zeros(len(features) - 1)
         prob_counts = np.zeros(len(features) - 1)
         
         for i, (start_idx, probs) in enumerate(zip(window_starts, all_probs)):
-            if self.use_center_frame:
-                # Calculate center region
-                center_start = int(len(probs) * (0.5 - self.center_ratio / 2))
-                center_end = int(len(probs) * (0.5 + self.center_ratio / 2))
-                
-                # For the FIRST window, also use predictions for early frames (0 to center_start)
-                # These frames would otherwise never be covered
-                if start_idx == 0:
-                    for j in range(0, center_end):
-                        global_idx = start_idx + j
-                        if 0 <= global_idx < len(full_probs):
-                            full_probs[global_idx] += probs[j]
-                            prob_counts[global_idx] += 1
-                # For the LAST window, also use predictions for late frames (center_end to end)
-                elif is_edge_window[i] or start_idx == window_starts[-1]:
-                    for j in range(center_start, len(probs)):
-                        global_idx = start_idx + j
-                        if 0 <= global_idx < len(full_probs):
-                            full_probs[global_idx] += probs[j]
-                            prob_counts[global_idx] += 1
-                else:
-                    # Normal center-only for middle windows
-                    for j in range(center_start, min(center_end, len(probs))):
-                        global_idx = start_idx + j
-                        if 0 <= global_idx < len(full_probs):
-                            full_probs[global_idx] += probs[j]
-                            prob_counts[global_idx] += 1
-            else:
-                # Use all predictions
-                for j, prob in enumerate(probs):
-                    global_idx = start_idx + j
-                    if 0 <= global_idx < len(full_probs):
-                        full_probs[global_idx] += prob
-                        prob_counts[global_idx] += 1
+            # FULL COVERAGE: Use all predictions from each window
+            # The overlapping windows will average predictions for middle frames
+            # and edge frames will get predictions from their respective edge windows
+            for j in range(len(probs)):
+                global_idx = start_idx + j
+                if 0 <= global_idx < len(full_probs):
+                    full_probs[global_idx] += probs[j]
+                    prob_counts[global_idx] += 1
         
         # Average overlapping predictions
+        # CRITICAL: Check for uncovered frames (should not happen with new strategy)
+        uncovered = np.where(prob_counts == 0)[0]
+        if len(uncovered) > 0:
+            # Fallback: interpolate from neighbors for any uncovered frames
+            for idx in uncovered:
+                left_idx = idx - 1
+                right_idx = idx + 1
+                vals = []
+                if left_idx >= 0 and prob_counts[left_idx] > 0:
+                    vals.append(full_probs[left_idx] / prob_counts[left_idx])
+                if right_idx < len(full_probs) and prob_counts[right_idx] > 0:
+                    vals.append(full_probs[right_idx] / prob_counts[right_idx])
+                if vals:
+                    full_probs[idx] = np.mean(vals)
+                    prob_counts[idx] = 1
+        
         prob_counts[prob_counts == 0] = 1  # Avoid division by zero
         full_probs = full_probs / prob_counts
         
@@ -257,17 +252,19 @@ class TransformerDetection(BaseDetectionMethod):
         
         return boundaries
     
-    def _batch_predict(self, windows: List[np.ndarray]) -> List[np.ndarray]:
+    def _batch_predict(self, windows: List[np.ndarray], return_duration: bool = False) -> List[np.ndarray]:
         """
         Batch inference for multiple windows.
         
         Args:
             windows: List of feature windows
+            return_duration: If True, also return duration predictions
             
         Returns:
-            List of probability arrays
+            List of probability arrays (and optionally duration arrays)
         """
         all_probs = []
+        all_durations = [] if return_duration else None
         
         with torch.no_grad():
             # Process in batches
@@ -279,15 +276,133 @@ class TransformerDetection(BaseDetectionMethod):
                 batch_tensor = torch.from_numpy(np.stack(batch_windows)).float()
                 batch_tensor = batch_tensor.to(self.device)
                 
-                # Forward pass
-                logits = self.model(batch_tensor, mode='frame')
-                probs = torch.sigmoid(logits).cpu().numpy()
+                # Forward pass - use multi-task mode if returning duration
+                if return_duration and hasattr(self.model, 'use_multi_task') and self.model.use_multi_task:
+                    outputs = self.model(batch_tensor, mode='frame_multi_task')
+                    if isinstance(outputs, dict):
+                        logits = outputs['class_logits']
+                        duration_pred = outputs['duration_pred']
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        durations = torch.expm1(duration_pred).cpu().numpy()  # Convert from log scale
+                    else:
+                        probs = torch.sigmoid(outputs).cpu().numpy()
+                        durations = None
+                else:
+                    logits = self.model(batch_tensor, mode='frame')
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    durations = None
                 
                 # Extract each window's predictions
                 for i in range(len(batch_windows)):
                     all_probs.append(probs[i, :, 0])
+                    if return_duration and durations is not None:
+                        all_durations.append(durations[i, :, 0])
         
+        if return_duration:
+            return all_probs, all_durations
         return all_probs
+    
+    def detect_boundaries_with_types(self, features: np.ndarray) -> List[dict]:
+        """
+        Detect boundaries with transition type information (cut vs gradual).
+        
+        Uses multi-task predictions to classify each detected boundary as:
+        - 'cut': duration ≈ 1 (sharp, instant transition)
+        - 'gradual': duration > 1 (dissolve, fade, wipe)
+        
+        Args:
+            features: Feature array of shape (N, feature_dim)
+            
+        Returns:
+            List of dictionaries with:
+            - 'frame': boundary frame index
+            - 'type': 'cut' or 'gradual'
+            - 'duration': predicted transition duration in frames
+            - 'confidence': boundary confidence score
+        """
+        if len(features) < 2:
+            return []
+        
+        # Collect windows (same as detect_boundaries)
+        windows = []
+        window_starts = []
+        stride = max(1, self.sequence_length // 2)
+        
+        for start_idx in range(0, len(features) - self.sequence_length + 1, stride):
+            end_idx = start_idx + self.sequence_length
+            windows.append(features[start_idx:end_idx])
+            window_starts.append(start_idx)
+        
+        if len(features) >= self.sequence_length:
+            last_start = len(features) - self.sequence_length
+            if not window_starts or window_starts[-1] != last_start:
+                windows.append(features[last_start:])
+                window_starts.append(last_start)
+        
+        if not windows and len(features) >= 2:
+            padded = np.zeros((self.sequence_length, features.shape[1]))
+            padded[:len(features)] = features
+            windows.append(padded)
+            window_starts.append(0)
+        
+        if not windows:
+            return []
+        
+        # Batch inference with duration predictions
+        result = self._batch_predict(windows, return_duration=True)
+        if isinstance(result, tuple):
+            all_probs, all_durations = result
+        else:
+            all_probs = result
+            all_durations = None
+        
+        # Aggregate probabilities and durations
+        full_probs = np.zeros(len(features) - 1)
+        full_durations = np.zeros(len(features) - 1)
+        prob_counts = np.zeros(len(features) - 1)
+        
+        for i, start_idx in enumerate(window_starts):
+            probs = all_probs[i]
+            durations = all_durations[i] if all_durations else None
+            
+            for j in range(len(probs)):
+                global_idx = start_idx + j
+                if 0 <= global_idx < len(full_probs):
+                    full_probs[global_idx] += probs[j]
+                    if durations is not None:
+                        full_durations[global_idx] += durations[j]
+                    prob_counts[global_idx] += 1
+        
+        # Average
+        prob_counts[prob_counts == 0] = 1
+        full_probs = full_probs / prob_counts
+        full_durations = full_durations / prob_counts
+        
+        # Find boundaries using NMS
+        if self.use_nms and HAS_SCIPY:
+            boundary_indices = self._nms_peak_detection(full_probs)
+        else:
+            boundary_indices = list(np.where(full_probs > self.confidence_threshold)[0])
+        
+        # Post-process
+        boundary_indices = self._post_process_boundaries(
+            boundary_indices, len(features), self.config.get("min_shot_duration", 30)
+        )
+        
+        # Build result with type information
+        results = []
+        for idx in boundary_indices:
+            duration = full_durations[idx] if all_durations else 1.0
+            transition_type = 'gradual' if duration > 1.5 else 'cut'
+            
+            results.append({
+                'frame': idx,
+                'type': transition_type,
+                'duration': float(duration),
+                'confidence': float(full_probs[idx])
+            })
+        
+        return results
     
     def _nms_peak_detection(self, probs: np.ndarray) -> List[int]:
         """
@@ -357,6 +472,107 @@ class TransformerDetection(BaseDetectionMethod):
     def name(self) -> str:
         """Return the name of the detection method."""
         return "transformer"
+
+
+class MultiScaleDifferenceLayer(nn.Module):
+    """
+    Multi-scale difference layer for detecting BOTH hard cuts AND gradual transitions.
+    
+    CRITICAL FOR GRADUAL TRANSITIONS:
+    - Hard cuts: Single-frame spike in difference magnitude
+    - Dissolves/Fades: Gradual increase in cumulative difference over 5-30 frames
+    
+    This layer computes differences at multiple scales:
+    - Scale 1: Frame-to-frame (catches hard cuts)
+    - Scale 3: Every 3rd frame (catches fast dissolves)
+    - Scale 5: Every 5th frame (catches medium dissolves)
+    - Scale 10: Every 10th frame (catches slow fades)
+    """
+    
+    def __init__(self, input_dim: int, scales: List[int] = None):
+        super().__init__()
+        self.input_dim = input_dim
+        self.scales = scales or [1, 3, 5, 10]  # Multi-scale time steps
+        
+        # Each scale produces: difference + magnitude + normalized_magnitude
+        features_per_scale = input_dim + 2
+        self.output_dim = features_per_scale * len(self.scales) + 4  # +4 for combined stats
+        
+        # Learnable scale weights (learn which scales are most important)
+        self.scale_weights = nn.Parameter(torch.ones(len(self.scales)) / len(self.scales))
+        
+        # Fusion MLP to combine multi-scale features
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.output_dim, input_dim),
+            nn.LayerNorm(input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, input_dim)
+        )
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        batch_size, seq_len, _ = x.shape
+        
+        all_scale_features = []
+        all_magnitudes = []
+        
+        for scale in self.scales:
+            if scale >= seq_len:
+                # Scale too large, use zeros
+                diff = torch.zeros(batch_size, seq_len - 1, self.input_dim, device=x.device, dtype=x.dtype)
+                magnitude = torch.zeros(batch_size, seq_len - 1, 1, device=x.device, dtype=x.dtype)
+            else:
+                # Compute difference at this scale: F[t+scale] - F[t]
+                diff = x[:, scale:, :] - x[:, :-scale, :]  # (batch, seq_len-scale, input_dim)
+                
+                # Pad to consistent length (seq_len - 1)
+                if diff.size(1) < seq_len - 1:
+                    pad_size = seq_len - 1 - diff.size(1)
+                    # Pad at the beginning (early frames don't have long-range history)
+                    diff = F.pad(diff, (0, 0, pad_size, 0), mode='constant', value=0)
+                elif diff.size(1) > seq_len - 1:
+                    diff = diff[:, :seq_len - 1, :]
+                
+                magnitude = torch.norm(diff, dim=-1, keepdim=True)
+            
+            # Normalize magnitude relative to local context
+            local_mean = F.avg_pool1d(
+                magnitude.transpose(1, 2),
+                kernel_size=min(7, seq_len - 1),
+                stride=1,
+                padding=min(3, (seq_len - 2) // 2)
+            ).transpose(1, 2)
+            if local_mean.size(1) != magnitude.size(1):
+                local_mean = local_mean[:, :magnitude.size(1), :]
+            normalized_mag = magnitude / (local_mean + 1e-8)
+            
+            # Combine: [diff, magnitude, normalized_magnitude]
+            scale_features = torch.cat([diff, magnitude, normalized_mag], dim=-1)
+            all_scale_features.append(scale_features)
+            all_magnitudes.append(magnitude)
+        
+        # Combine all scales
+        multi_scale = torch.cat(all_scale_features, dim=-1)
+        
+        # Compute combined statistics across scales
+        stacked_mags = torch.stack(all_magnitudes, dim=-1)  # (batch, seq_len-1, 1, num_scales)
+        mag_mean = stacked_mags.mean(dim=-1)
+        mag_max = stacked_mags.max(dim=-1)[0]
+        mag_std = stacked_mags.std(dim=-1)
+        
+        # Weighted magnitude (learned scale importance)
+        weights = F.softmax(self.scale_weights, dim=0)
+        weighted_mag = (stacked_mags.squeeze(-2) * weights).sum(dim=-1, keepdim=True)
+        
+        combined_stats = torch.cat([mag_mean, mag_max, mag_std, weighted_mag], dim=-1)
+        
+        # Final multi-scale output
+        output = torch.cat([multi_scale, combined_stats], dim=-1)
+        
+        # Apply fusion MLP
+        output = self.fusion_mlp(output)
+        
+        # Return weighted magnitude for skip connection
+        return output, seq_len - 1, weighted_mag
 
 
 class DifferenceLayer(nn.Module):
@@ -522,7 +738,7 @@ class BoundaryDetectionTransformer(nn.Module):
     Transformer model for boundary detection with:
     - Frame difference features (learns from changes, not raw content)
     - Causal attention (each position only sees past frames)
-    - Multi-scale difference features (1st and 2nd order)
+    - Multi-scale difference features for GRADUAL TRANSITION detection
     - Magnitude skip connection (direct path from difference magnitude to output)
     - Neighbor context for better spike detection
     """
@@ -534,7 +750,8 @@ class BoundaryDetectionTransformer(nn.Module):
                  use_causal_attention: bool = True,
                  use_difference_features: bool = True,
                  use_magnitude_skip: bool = True,
-                 drop_path_rate: float = 0.1):
+                 drop_path_rate: float = 0.1,
+                 use_multi_scale: bool = True):  # NEW: Multi-scale for gradual transitions
         super().__init__()
         
         self.input_dim = input_dim
@@ -544,17 +761,28 @@ class BoundaryDetectionTransformer(nn.Module):
         self.use_difference_features = use_difference_features
         self.use_magnitude_skip = use_magnitude_skip
         self.drop_path_rate = drop_path_rate
+        self.use_multi_scale = use_multi_scale
         
-        # Difference layer for computing frame differences
+        # CRITICAL FOR GRADUAL TRANSITIONS: Multi-scale difference layer
+        # Detects both hard cuts (scale=1) and gradual transitions (scales 3, 5, 10)
         if use_difference_features:
-            self.difference_layer = DifferenceLayer(
-                input_dim=input_dim,
-                include_magnitude=True,
-                include_second_order=True,
-                include_neighbor_context=True,
-                neighbor_window=2
-            )
-            projection_input_dim = self.difference_layer.output_dim
+            if use_multi_scale:
+                # Multi-scale for gradual transitions
+                self.difference_layer = MultiScaleDifferenceLayer(
+                    input_dim=input_dim,
+                    scales=[1, 3, 5, 10]  # Detect changes at multiple time scales
+                )
+                projection_input_dim = input_dim  # MultiScale outputs input_dim
+            else:
+                # Original single-scale (for backward compat)
+                self.difference_layer = DifferenceLayer(
+                    input_dim=input_dim,
+                    include_magnitude=True,
+                    include_second_order=True,
+                    include_neighbor_context=True,
+                    neighbor_window=2
+                )
+                projection_input_dim = self.difference_layer.output_dim
         else:
             self.difference_layer = None
             projection_input_dim = input_dim
@@ -576,14 +804,17 @@ class BoundaryDetectionTransformer(nn.Module):
                 nn.LayerNorm(hidden_dim),
             )
         
-        # Temporal Convolutional Network (TCN) for local pattern capture
-        # Captures local temporal patterns BEFORE global attention
-        # This helps detect sharp transitions that might be diluted by attention
+        # Temporal Convolutional Network (TCN) with MULTI-SCALE kernels
+        # Different kernel sizes capture patterns at different temporal scales
+        # This is CRITICAL for gradual transitions which have patterns over 5-30 frames
         self.tcn = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=1),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=1),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=1),  # Larger kernel for gradual
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=15, padding=7, groups=1),  # Even larger for slow fades
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -658,9 +889,64 @@ class BoundaryDetectionTransformer(nn.Module):
         self.frame_ln2 = nn.LayerNorm(128)
         self.frame_fc2_res = nn.Linear(hidden_dim // 2, 128)
         
-        # Output layer
+        # Output layer - CLASSIFICATION HEAD (binary: is this a boundary?)
         self.frame_output = nn.Linear(128, 1)
         self.frame_dropout = nn.Dropout(dropout)
+        
+        # =====================================================================
+        # MULTI-TASK HEAD: Duration Regression with TEMPORAL CONTEXT
+        # 
+        # Key insight: To distinguish cuts from graduals, the model needs to see
+        # HOW features change over time, not just the features at a single frame.
+        # - Cuts: Sharp, sudden change at ONE frame
+        # - Graduals: Smooth, gradual change over MULTIPLE frames
+        #
+        # Solution: Add temporal convolution to capture neighboring frame patterns
+        # before predicting duration. This lets the head learn:
+        # - "Sharp spike in features" → Cut → duration ≈ 1
+        # - "Gradual ramp in features" → Gradual → duration > 1
+        # =====================================================================
+        self.use_multi_task = True  # Can be disabled for backward compat
+        
+        # Temporal context aggregation (1D conv over sequence dimension)
+        # IMPORTANT: We use MULTI-SCALE convolutions to capture:
+        # - Local patterns (k=3): sharp cut transitions
+        # - Medium patterns (k=7): short graduals
+        # - Wide patterns (k=15): long dissolves/fades
+        self.duration_temporal_conv = nn.Sequential(
+            # Conv1d expects (batch, channels, length)
+            nn.Conv1d(128, 64, kernel_size=3, padding=1),  # Local: ±1 frames
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=7, padding=3),   # Medium: ±3 frames  
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 32, kernel_size=15, padding=7),  # Wide: ±7 frames
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+        )
+        
+        # Magnitude temporal analysis - critical for distinguishing cuts vs graduals!
+        # Cuts: single HIGH spike in magnitude
+        # Graduals: spread of MODERATE values over time
+        self.magnitude_temporal_conv = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=3, padding=1),   # Local magnitude pattern
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+            nn.Conv1d(8, 8, kernel_size=11, padding=5),  # Wider context
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+        )
+        
+        # Duration regression head (combines hidden features + magnitude patterns)
+        # Input: 32 (from h2_temporal) + 8 (from magnitude patterns) = 40
+        self.duration_head = nn.Sequential(
+            nn.Linear(40, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),  # Less dropout for regression
+            nn.Linear(32, 1)  # Output: log(1 + duration)
+        )
         
         # Learnable weight for magnitude skip connection
         if use_magnitude_skip:
@@ -761,7 +1047,7 @@ class BoundaryDetectionTransformer(nn.Module):
             logits = self.sequence_classifier(sequence_repr)  # (batch_size, 1)
             return logits
         
-        else:  # mode == 'frame'
+        else:  # mode == 'frame' or mode == 'frame_multi_task'
             # FRAME-LEVEL CLASSIFICATION with magnitude skip and residual connections
             # Each position in encoded represents a frame transition (difference)
             
@@ -789,10 +1075,50 @@ class BoundaryDetectionTransformer(nn.Module):
             h2 = self.frame_dropout(h2)
             h2 = h2 + self.frame_fc2_res(h1)  # Residual
             
-            # Output
-            logits = self.frame_output(h2)  # (batch_size, seq_len-1, 1)
+            # Classification output
+            class_logits = self.frame_output(h2)  # (batch_size, seq_len-1, 1)
             
-            return logits
+            # =====================================================================
+            # MULTI-TASK: Duration Regression Head with TEMPORAL CONTEXT
+            # Predicts log(1 + duration) for transition type awareness
+            # Uses temporal convolution to see neighboring frame patterns
+            # CRITICAL: Also uses MAGNITUDE patterns to distinguish cuts/graduals!
+            # =====================================================================
+            if mode == 'frame_multi_task' and hasattr(self, 'use_multi_task') and self.use_multi_task:
+                # h2 shape: (batch_size, seq_len-1, 128)
+                # Conv1d needs: (batch, channels, length) -> (batch, 128, seq_len-1)
+                h2_conv = h2.transpose(1, 2)  # (batch, 128, seq_len-1)
+                
+                # Apply temporal convolution to capture transition shape from hidden features
+                h2_temporal = self.duration_temporal_conv(h2_conv)  # (batch, 32, seq_len-1)
+                h2_temporal = h2_temporal.transpose(1, 2)  # (batch, seq_len-1, 32)
+                
+                # Apply temporal convolution to magnitude signal
+                # This is KEY for cuts vs graduals: cuts have sharp spike, graduals have spread
+                if magnitude is not None:
+                    # magnitude: (batch, seq_len-1, 1)
+                    mag_conv = magnitude.transpose(1, 2)  # (batch, 1, seq_len-1)
+                    mag_temporal = self.magnitude_temporal_conv(mag_conv)  # (batch, 8, seq_len-1)
+                    mag_temporal = mag_temporal.transpose(1, 2)  # (batch, seq_len-1, 8)
+                    
+                    # Concatenate hidden features with magnitude patterns
+                    duration_input = torch.cat([h2_temporal, mag_temporal], dim=-1)  # (batch, seq_len-1, 40)
+                else:
+                    # Fallback: pad with zeros if no magnitude
+                    pad = torch.zeros(h2_temporal.shape[0], h2_temporal.shape[1], 8, device=h2.device)
+                    duration_input = torch.cat([h2_temporal, pad], dim=-1)
+                
+                # Duration prediction from combined features
+                duration_pred = self.duration_head(duration_input)  # (batch_size, seq_len-1, 1)
+                
+                # Return both outputs as a dictionary
+                return {
+                    'class_logits': class_logits,
+                    'duration_pred': duration_pred
+                }
+            
+            # Standard mode: return only classification logits (backward compatible)
+            return class_logits
 
 
 class PositionalEncoding(nn.Module):
@@ -834,12 +1160,22 @@ class TransformerTrainer:
     """
     Trainer for the transformer boundary detection model.
     Uses FRAME-LEVEL classification for precise boundary localization.
+    
+    Supports MULTI-TASK LEARNING:
+    - Binary classification: Is this frame a boundary?
+    - Duration regression: How long is the transition?
+    
+    The duration task teaches the model to recognize gradual transitions!
     """
     
     def __init__(self, model: BoundaryDetectionTransformer, config: Dict[str, Any]):
         self.model = model
         self.config = config
         self.device = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Multi-task learning flag - ONLY enabled when loss_type == "multi_task"
+        # Will be set to True below if loss_type is "multi_task"
+        self.use_multi_task = False
         
         # Training parameters
         self.learning_rate = config.get("learning_rate", 1e-4)
@@ -865,7 +1201,7 @@ class TransformerTrainer:
         # 
         # Strategy: Use Soft F1 Loss as primary for direct F1 optimization
         
-        loss_type = config.get("loss_type", "soft_f1")  # "bce", "focal", "combo", "soft_f1", "combo_v2" - DEFAULT: combo_v2
+        loss_type = config.get("loss_type", "multi_task")  # "bce", "focal", "combo", "soft_f1", "combo_v2" - DEFAULT: combo_v2
         
         if loss_type == "focal":
             # Focal Loss for FRAME-LEVEL extreme imbalance (1:56.6)
@@ -912,12 +1248,11 @@ class TransformerTrainer:
             focal_alpha = config.get("focal_alpha", 0.75)
             focal_gamma = config.get("focal_gamma", 2.0)
             # Tversky: alpha=FP weight, beta=FN weight
-            # For real-world distribution (1:133 imbalance), we MUST penalize FP aggressively
-            # to prevent massive over-prediction on unseen videos.
-            # Previous: alpha=0.6, beta=0.4 → Val 83K FP vs 34K TP (2.4x overprediction)
-            # Now: alpha=0.7, beta=0.3 → Much stronger FP penalty for better precision
-            tversky_alpha = config.get("tversky_alpha", 0.6)  # Balanced FP penalty
-            tversky_beta = config.get("tversky_beta", 0.4)    # Balanced FN penalty
+            # BALANCED for F1: alpha=beta=0.5 is equivalent to Dice/F1 loss
+            # Previous alpha=0.6, beta=0.4 gave P=0.87, R=0.67 → F1 limited by low recall
+            # Now: alpha=0.4, beta=0.6 → Slightly favor recall to balance P/R for higher F1
+            tversky_alpha = config.get("tversky_alpha", 0.4)  # Lower FP penalty
+            tversky_beta = config.get("tversky_beta", 0.6)    # Higher FN penalty → better recall
             focal_weight = config.get("focal_weight", 0.3)  # 30% focal for imbalance
             tversky_weight = config.get("tversky_weight", 0.4)  # 40% tversky for stronger P/R control
             f1_weight = config.get("f1_weight", 0.3)  # 30% direct F1 optimization
@@ -930,7 +1265,45 @@ class TransformerTrainer:
             print(f"  Focal: {focal_weight*100:.0f}% weight")
             print(f"  Tversky: {tversky_weight*100:.0f}% weight (alpha={tversky_alpha}, beta={tversky_beta})")
             print(f"  Soft F1: {f1_weight*100:.0f}% weight")
-            print(f"  Mode: HIGH PRECISION focus (alpha >> beta to prevent overprediction)")
+            print(f"  Mode: BALANCED F1 focus (alpha<beta favors recall to maximize F1)")
+        
+        elif loss_type == "multi_task":
+            # =========================================================================
+            # MULTI-TASK LEARNING: Classification + Duration Regression
+            # This is the KEY for learning gradual transitions!
+            # 
+            # The duration head teaches the model:
+            # - Cuts: Sharp spikes, duration ≈ 1
+            # - Gradual: Sustained changes over 5-30+ frames
+            # =========================================================================
+            from focal_loss import MultiTaskBoundaryLoss
+            
+            # Classification component params
+            focal_alpha = config.get("focal_alpha", 0.75)
+            focal_gamma = config.get("focal_gamma", 2.0)
+            tversky_alpha = config.get("tversky_alpha", 0.4)
+            tversky_beta = config.get("tversky_beta", 0.6)
+            
+            # Duration regression params
+            gradual_weight = config.get("gradual_weight", 3.0)  # 3x weight for gradual
+            
+            # Task weights
+            classification_weight = config.get("classification_weight", 0.6)
+            duration_weight = config.get("duration_weight", 0.4)
+            
+            self.criterion = MultiTaskBoundaryLoss(
+                focal_alpha=focal_alpha, focal_gamma=focal_gamma,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                gradual_weight=gradual_weight,
+                classification_weight=classification_weight,
+                duration_weight=duration_weight
+            )
+            self.use_multi_task = True
+            print(f"Using MULTI-TASK Loss (Classification + Duration):")
+            print(f"  Classification: {classification_weight*100:.0f}% weight")
+            print(f"  Duration Regression: {duration_weight*100:.0f}% weight")
+            print(f"  Gradual transition boost: {gradual_weight}x")
+            print(f"  This teaches the model gradual transition SIGNATURES!")
             
         elif loss_type == "adaptive_focal":
             from focal_loss import AdaptiveFocalLoss
@@ -947,11 +1320,12 @@ class TransformerTrainer:
         print(f"  Classification threshold: {self.classification_threshold}")
         print(f"  Goal: F1 > 0.8!")
         
-        # Optimizer with higher weight decay for regularization
+        # Optimizer with STRONG weight decay to prevent overfitting
+        # Previous 1e-4 was too weak - model was overfitting severely
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=self.learning_rate,
-            weight_decay=1e-4  # Increased for better regularization
+            weight_decay=5e-4  # 5x increase for better regularization
         )
         
         # Learning rate scheduler - ReduceLROnPlateau for smooth training without dips
@@ -968,20 +1342,21 @@ class TransformerTrainer:
     def _compute_tolerance_metrics(self, predictions: torch.Tensor, targets: torch.Tensor, 
                                    tolerance: int = 3) -> Tuple[int, int, int, int]:
         """
-        Compute TP, FP, FN, TN with temporal tolerance (standard in SBD benchmarks).
+        Compute TP, FP, FN, TN with FRAME-LEVEL matching and temporal tolerance.
         
-        Standard SBD evaluation protocol (used in TransNetV2, ClipShots, etc.):
-        - Each GT boundary can match at most ONE prediction (closest within tolerance)
-        - Each prediction can match at most ONE GT boundary
-        - Greedy matching: process GT boundaries and find closest unmatched prediction
+        CRITICAL FIX: Use frame-level metrics instead of region-grouping.
+        Region-grouping caused train/val metric mismatch because:
+        1. Same transition appears in different batches (overlapping windows)
+        2. Region counting in each batch leads to inflated TP counts
         
-        This gives the standard Precision/Recall where:
-        - Precision = matched_predictions / total_predictions
-        - Recall = matched_gt / total_gt
+        New approach: Standard frame-level tolerance matching
+        - For each predicted boundary, check if any GT is within ±tolerance
+        - For each GT boundary, check if any prediction is within ±tolerance
+        - ONE-TO-ONE matching to prevent double counting
         
         Args:
             predictions: Binary predictions (batch, seq_len-1)
-            targets: Binary ground truth (batch, seq_len-1)
+            targets: Target labels - can be soft (0-1) or binary (batch, seq_len-1)
             tolerance: Number of frames tolerance (±tolerance)
             
         Returns:
@@ -995,7 +1370,7 @@ class TransformerTrainer:
         total_fn = 0
         total_tn = 0
         
-        batch_size = predictions_np.shape[0]
+        batch_size = predictions_np.shape[0] if len(predictions_np.shape) > 1 else 1
         
         for seq_idx in range(batch_size):
             if len(predictions_np.shape) > 1:
@@ -1007,38 +1382,58 @@ class TransformerTrainer:
             
             seq_len = len(seq_preds)
             
-            # Get indices of predicted and ground truth boundaries
+            # Get indices of predictions and GT peaks
             pred_indices = list(np.where(seq_preds == 1)[0])
-            gt_indices = list(np.where(seq_targets >= 0.5)[0])
             
-            # ONE-TO-ONE MATCHING (standard SBD protocol)
-            # Each GT matches at most one prediction, each prediction matches at most one GT
-            matched_pred = set()
-            matched_gt = set()
+            # For GT: Group consecutive positive frames into SINGLE transitions
+            # Then take the CENTER of each group as the GT peak
+            # This ensures 1 GT peak per transition even with ±1 neighbor labeling
+            gt_peaks = []
+            gt_positive_indices = np.where(seq_targets >= 0.5)[0]
             
-            # Sort GT by position for consistent matching
-            for gt_idx in sorted(gt_indices):
-                # Find closest unmatched prediction within tolerance
-                best_pred = None
-                best_dist = tolerance + 1
+            if len(gt_positive_indices) > 0:
+                # Group consecutive indices into transitions
+                groups = []
+                current_group = [gt_positive_indices[0]]
                 
-                for pred_idx in pred_indices:
-                    if pred_idx in matched_pred:
-                        continue
-                    dist = abs(pred_idx - gt_idx)
-                    if dist <= tolerance and dist < best_dist:
-                        best_dist = dist
-                        best_pred = pred_idx
+                for idx in gt_positive_indices[1:]:
+                    if idx <= current_group[-1] + 1:  # Consecutive or adjacent
+                        current_group.append(idx)
+                    else:
+                        groups.append(current_group)
+                        current_group = [idx]
+                groups.append(current_group)  # Don't forget last group
                 
-                if best_pred is not None:
-                    matched_pred.add(best_pred)
-                    matched_gt.add(gt_idx)
+                # Take center of each group as the GT peak (1 peak per transition)
+                for group in groups:
+                    center = group[len(group) // 2]
+                    gt_peaks.append(center)
             
-            # Standard SBD metrics
-            tp = len(matched_pred)  # = len(matched_gt), matched pairs
-            fp = len(pred_indices) - tp  # Unmatched predictions
-            fn = len(gt_indices) - tp  # Unmatched GT boundaries
-            tn = seq_len - len(pred_indices) - fn  # Non-boundary frames not predicted
+            # ONE-TO-ONE MATCHING with tolerance
+            # Each prediction can match at most one GT, each GT can match at most one prediction
+            matched_preds = set()
+            matched_gts = set()
+            
+            # Sort by distance for greedy matching (closest pairs first)
+            matches = []
+            for p_idx, pred in enumerate(pred_indices):
+                for g_idx, gt in enumerate(gt_peaks):
+                    dist = abs(pred - gt)
+                    if dist <= tolerance:
+                        matches.append((dist, p_idx, g_idx))
+            
+            matches.sort(key=lambda x: x[0])  # Sort by distance
+            
+            for dist, p_idx, g_idx in matches:
+                if p_idx not in matched_preds and g_idx not in matched_gts:
+                    matched_preds.add(p_idx)
+                    matched_gts.add(g_idx)
+            
+            # Compute metrics
+            tp = len(matched_gts)  # Correctly detected boundaries
+            fp = len(pred_indices) - len(matched_preds)  # Spurious predictions
+            fn = len(gt_peaks) - len(matched_gts)  # Missed boundaries
+            tn = seq_len - len(gt_peaks) - fp  # Non-boundaries correctly not predicted
             
             total_tp += tp
             total_fp += fp
@@ -1149,17 +1544,53 @@ class TransformerTrainer:
         self.optimizer.zero_grad()
         accumulated_loss = 0.0
         
+        # Track multi-task losses separately
+        accumulated_cls_loss = 0.0
+        accumulated_dur_loss = 0.0
+        
         for batch_idx, batch in enumerate(batch_iterator):
-            sequences, frame_labels = batch  # frame_labels shape: (batch, seq_len-1)
-            sequences = sequences.to(self.device)
-            frame_labels = frame_labels.to(self.device)  # Keep frame-level labels!
-            
-            # Forward pass in FRAME mode for frame-level classification
-            logits = self.model(sequences, mode='frame')  # (batch, seq_len-1, 1)
-            logits = logits.squeeze(-1)  # (batch, seq_len-1)
-            
-            # Compute loss at FRAME level (scaled for gradient accumulation)
-            loss = self.criterion(logits, frame_labels) / self.gradient_accumulation_steps
+            # =====================================================================
+            # MULTI-TASK TRAINING: Handle both classification and duration labels
+            # =====================================================================
+            if self.use_multi_task and len(batch) == 3:
+                # Multi-task mode: (sequences, class_labels, duration_labels)
+                sequences, frame_labels, duration_labels = batch
+                sequences = sequences.to(self.device)
+                frame_labels = frame_labels.to(self.device)
+                duration_labels = duration_labels.to(self.device)
+                
+                # Forward pass in MULTI-TASK mode
+                outputs = self.model(sequences, mode='frame_multi_task')
+                
+                if isinstance(outputs, dict):
+                    class_logits = outputs['class_logits'].squeeze(-1)  # (batch, seq_len-1)
+                    duration_pred = outputs['duration_pred'].squeeze(-1)  # (batch, seq_len-1)
+                    
+                    # Compute multi-task loss
+                    loss_dict = self.criterion(class_logits, duration_pred, frame_labels, duration_labels)
+                    loss = loss_dict['total'] / self.gradient_accumulation_steps
+                    
+                    # Track component losses for logging
+                    accumulated_cls_loss += loss_dict['classification'].item()
+                    accumulated_dur_loss += loss_dict['duration'].item()
+                    
+                    logits = class_logits  # For metrics computation
+                else:
+                    # Fallback: model returned tensor (no multi-task head)
+                    logits = outputs.squeeze(-1) if outputs.dim() == 3 else outputs
+                    loss = self.criterion(logits, frame_labels) / self.gradient_accumulation_steps
+            else:
+                # Standard single-task mode
+                sequences, frame_labels = batch[:2]  # Handle both 2-tuple and 3-tuple
+                sequences = sequences.to(self.device)
+                frame_labels = frame_labels.to(self.device)
+                
+                # Forward pass in FRAME mode for frame-level classification
+                logits = self.model(sequences, mode='frame')  # (batch, seq_len-1, 1)
+                logits = logits.squeeze(-1)  # (batch, seq_len-1)
+                
+                # Compute loss at FRAME level (scaled for gradient accumulation)
+                loss = self.criterion(logits, frame_labels) / self.gradient_accumulation_steps
             
             # Backward pass (accumulate gradients)
             loss.backward()
@@ -1257,25 +1688,86 @@ class TransformerTrainer:
         false_negatives = 0
         true_negatives = 0
         
+        # Track duration metrics for multi-task mode
+        total_duration_mae = 0.0
+        total_duration_samples = 0
+        gradual_correct = 0
+        gradual_total = 0
+        
+        # Use SAME threshold as training for fair comparison during training
+        # (higher threshold + NMS will be used at final inference time)
+        val_threshold = self.classification_threshold
+        
         # Add progress bar for validation batches
         batch_iterator = tqdm(val_loader, desc="Validation batches", leave=False)
         
         with torch.no_grad():
-            for batch in batch_iterator:
-                sequences, frame_labels = batch
-                sequences = sequences.to(self.device)
-                frame_labels = frame_labels.to(self.device)
+            for batch_idx, batch in enumerate(batch_iterator):
+                # =====================================================================
+                # MULTI-TASK VALIDATION: Handle both classification and duration
+                # =====================================================================
+                if self.use_multi_task and len(batch) == 3:
+                    sequences, frame_labels, duration_labels = batch
+                    sequences = sequences.to(self.device)
+                    frame_labels = frame_labels.to(self.device)
+                    duration_labels = duration_labels.to(self.device)
+                    
+                    # Forward pass in MULTI-TASK mode
+                    outputs = self.model(sequences, mode='frame_multi_task')
+                    
+                    if isinstance(outputs, dict):
+                        class_logits = outputs['class_logits'].squeeze(-1)
+                        duration_pred = outputs['duration_pred'].squeeze(-1)
+                        
+                        # Compute multi-task loss
+                        loss_dict = self.criterion(class_logits, duration_pred, frame_labels, duration_labels)
+                        loss = loss_dict['total']
+                        
+                        # Evaluate duration prediction on boundary frames
+                        boundary_mask = frame_labels > 0.5
+                        if boundary_mask.sum() > 0:
+                            pred_dur = torch.expm1(duration_pred[boundary_mask])  # Convert from log scale
+                            true_dur = duration_labels[boundary_mask]
+                            duration_mae = torch.abs(pred_dur - true_dur).mean()
+                            total_duration_mae += duration_mae.item() * boundary_mask.sum().item()
+                            total_duration_samples += boundary_mask.sum().item()
+                            
+                            # Check gradual detection (duration > 2)
+                            # ClipShots format: cuts are [n, n+1] so duration=2
+                            # Graduals span more frames, so duration > 2
+                            is_gradual_true = true_dur > 2.5
+                            is_gradual_pred = pred_dur > 2.5
+                            gradual_correct += (is_gradual_true == is_gradual_pred).sum().item()
+                            gradual_total += is_gradual_true.numel()
+                            
+                            # Track actual predictions for debugging - ACCUMULATE all batches
+                            if not hasattr(self, '_debug_dur_pred_list'):
+                                self._debug_dur_pred_list = []
+                                self._debug_dur_true_list = []
+                            self._debug_dur_pred_list.append(pred_dur.detach().cpu().numpy())
+                            self._debug_dur_true_list.append(true_dur.detach().cpu().numpy())
+                        
+                        logits = class_logits
+                    else:
+                        logits = outputs.squeeze(-1) if outputs.dim() == 3 else outputs
+                        loss = self.criterion(logits, frame_labels)
+                else:
+                    # Standard single-task validation
+                    sequences, frame_labels = batch[:2]
+                    sequences = sequences.to(self.device)
+                    frame_labels = frame_labels.to(self.device)
+                    
+                    # Forward pass in FRAME mode
+                    logits = self.model(sequences, mode='frame')  # (batch, seq_len-1, 1)
+                    logits = logits.squeeze(-1)  # (batch, seq_len-1)
+                    
+                    # Compute loss at FRAME level
+                    loss = self.criterion(logits, frame_labels)
                 
-                # Forward pass in FRAME mode
-                logits = self.model(sequences, mode='frame')  # (batch, seq_len-1, 1)
-                logits = logits.squeeze(-1)  # (batch, seq_len-1)
-                
-                # Compute loss at FRAME level
-                loss = self.criterion(logits, frame_labels)
                 total_loss += loss.item()
                 
-                # FRAME-LEVEL predictions with tolerance
-                predictions = (torch.sigmoid(logits) > self.classification_threshold).float()
+                # FRAME-LEVEL predictions - use SAME threshold as training
+                predictions = (torch.sigmoid(logits) > val_threshold).float()
                 
                 # Compute tolerance-based metrics (standard in SBD benchmarks)
                 tp, fp, fn, tn = self._compute_tolerance_metrics(
@@ -1307,6 +1799,40 @@ class TransformerTrainer:
         print(f"\n  Validation Summary (tolerance=±{self.temporal_tolerance} frames):")
         print(f"    TP={true_positives}, FP={false_positives}, FN={false_negatives}")
         print(f"    Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+        
+        # Print duration metrics for multi-task mode
+        if self.use_multi_task and total_duration_samples > 0:
+            avg_duration_mae = total_duration_mae / total_duration_samples
+            gradual_accuracy = gradual_correct / gradual_total if gradual_total > 0 else 0
+            print(f"    Duration MAE={avg_duration_mae:.2f} frames")
+            print(f"    Gradual/Cut classification accuracy={gradual_accuracy:.4f}")
+            
+            # Debug: Show actual duration predictions distribution (accumulated across ALL batches)
+            if hasattr(self, '_debug_dur_pred_list') and len(self._debug_dur_pred_list) > 0:
+                import numpy as np
+                pred = np.concatenate(self._debug_dur_pred_list)
+                true = np.concatenate(self._debug_dur_true_list)
+                # Clear for next validation
+                self._debug_dur_pred_list = []
+                self._debug_dur_true_list = []
+                
+                print(f"    Duration preds - Min:{pred.min():.2f}, Max:{pred.max():.2f}, Mean:{pred.mean():.2f}, Std:{pred.std():.2f}")
+                print(f"    Duration true  - Min:{true.min():.2f}, Max:{true.max():.2f}, Mean:{true.mean():.2f}")
+                # Check discrimination: what % of cuts are predicted as cuts?
+                cuts_mask = true <= 2.5  # ClipShots: cuts are [n, n+1] = duration 2
+                grads_mask = true > 2.5   # Graduals span more frames
+                if cuts_mask.sum() > 0:
+                    cut_pred_mean = pred[cuts_mask].mean()
+                    cut_pred_std = pred[cuts_mask].std()
+                    print(f"    Cuts (n={cuts_mask.sum()}): mean pred = {cut_pred_mean:.2f} ± {cut_pred_std:.2f} (should be ~2.0)")
+                else:
+                    print(f"    Cuts (n=0): No cuts in validation set")
+                if grads_mask.sum() > 0:
+                    grad_pred_mean = pred[grads_mask].mean()
+                    grad_pred_std = pred[grads_mask].std()
+                    print(f"    Graduals (n={grads_mask.sum()}): mean pred = {grad_pred_mean:.2f} ± {grad_pred_std:.2f} (should be >3.0)")
+                else:
+                    print(f"    Graduals (n=0): No graduals in validation set")
         
         return avg_loss, accuracy, precision, recall
     
