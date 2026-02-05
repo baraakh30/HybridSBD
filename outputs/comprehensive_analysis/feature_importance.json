@@ -1,0 +1,299 @@
+{
+  "feature_names": [
+    "acceleration_mean",
+    "acceleration_std",
+    "autocorr_lag1",
+    "autocorr_lag2",
+    "autocorr_lag4",
+    "color_hist_change_max",
+    "color_hist_change_mean",
+    "color_hist_change_std",
+    "color_moment_change_max",
+    "color_moment_change_mean",
+    "dct_ac_energy",
+    "dct_dc",
+    "diff_gap1_max",
+    "diff_gap1_mean",
+    "diff_gap1_peak_prominence",
+    "diff_gap1_std",
+    "diff_gap2_max",
+    "diff_gap2_mean",
+    "diff_gap2_peak_prominence",
+    "diff_gap2_std",
+    "diff_gap4_max",
+    "diff_gap4_mean",
+    "diff_gap4_peak_prominence",
+    "diff_gap4_std",
+    "diff_gap8_max",
+    "diff_gap8_mean",
+    "diff_gap8_peak_prominence",
+    "diff_gap8_std",
+    "dominant_color_change_max",
+    "dominant_color_change_mean",
+    "dominant_frequency",
+    "dominant_frequency_power",
+    "edge_density_diff_max",
+    "edge_density_diff_mean",
+    "entropy_diff_max",
+    "entropy_diff_mean",
+    "flow_change_max",
+    "flow_change_mean",
+    "flow_direction_change_max",
+    "flow_direction_change_mean",
+    "flow_magnitude_max",
+    "flow_magnitude_mean",
+    "flow_magnitude_std",
+    "gradient_diff_max",
+    "gradient_diff_mean",
+    "high_change_ratio",
+    "hsv_change_max",
+    "hsv_change_mean",
+    "jerk_mean",
+    "jerk_std",
+    "js_divergence_max",
+    "js_divergence_mean",
+    "kl_divergence_max",
+    "kl_divergence_mean",
+    "post_mean_change",
+    "post_stability",
+    "pre_mean_change",
+    "pre_stability",
+    "spectral_centroid",
+    "spectral_energy",
+    "spectral_spread",
+    "ssim_mean",
+    "ssim_min",
+    "ssim_std",
+    "symmetry",
+    "texture_change_max",
+    "texture_change_mean",
+    "transition_duration",
+    "velocity_mean",
+    "velocity_std"
+  ],
+  "importances": [
+    0.0005166085743275278,
+    0.022219439727282925,
+    0.010488685829725152,
+    0.012915536173521558,
+    0.013689402279753406,
+    0.0065570183705224,
+    0.00741951640679604,
+    0.005650913543059673,
+    0.016280965991883067,
+    0.00954284006795167,
+    0.0009841780856485497,
+    0.020545951299811696,
+    0.05158087882582836,
+    0.033224486453659184,
+    0.02200113175123308,
+    0.01344287319154106,
+    0.04411838796177599,
+    0.03024212687762802,
+    0.04259363762593605,
+    0.009481350242632539,
+    0.0175072836839408,
+    0.054275605387986606,
+    0.011370848679079573,
+    0.008148346293807314,
+    0.0057421327947288795,
+    0.04469518851853075,
+    0.0069860535339020735,
+    0.013986461814258175,
+    0.0012997760707959744,
+    0.005381199094167761,
+    0.00041333945494906636,
+    0.0006590269947453253,
+    0.00586118357299491,
+    0.01858666744500184,
+    0.006237252017861875,
+    0.004742887812905736,
+    0.003415158489599702,
+    0.008025027165221476,
+    0.011240938634922759,
+    0.00896044368021702,
+    0.003492552128596242,
+    0.012553212958392852,
+    0.003611327525595002,
+    0.005028135186496376,
+    0.005534291822422652,
+    4.479263211990532e-05,
+    0.052639476981137176,
+    0.010342841648338768,
+    0.0013895140438898105,
+    0.033598658814246056,
+    0.002608189291877202,
+    0.0058432037555973095,
+    0.0060333171723869605,
+    0.00710732708719066,
+    0.05728389300076508,
+    0.00040494998983170346,
+    0.0012771843467710559,
+    0.004048464542163953,
+    0.03434200204100318,
+    0.04758364340852256,
+    0.0010678976180049742,
+    0.01813119735758401,
+    0.009117019065349298,
+    0.0061239460107910485,
+    0.00029022349562744153,
+    0.00897815025540327,
+    0.011438882784044358,
+    0.0007128134149386841,
+    0.031016606758952552,
+    0.0073255344418243105
+  ],
+  "top_features": [
+    {
+      "name": "post_mean_change",
+      "importance": 0.05728389300076508,
+      "rank": 1
+    },
+    {
+      "name": "diff_gap4_mean",
+      "importance": 0.054275605387986606,
+      "rank": 2
+    },
+    {
+      "name": "hsv_change_max",
+      "importance": 0.052639476981137176,
+      "rank": 3
+    },
+    {
+      "name": "diff_gap1_max",
+      "importance": 0.05158087882582836,
+      "rank": 4
+    },
+    {
+      "name": "spectral_energy",
+      "importance": 0.04758364340852256,
+      "rank": 5
+    },
+    {
+      "name": "diff_gap8_mean",
+      "importance": 0.04469518851853075,
+      "rank": 6
+    },
+    {
+      "name": "diff_gap2_max",
+      "importance": 0.04411838796177599,
+      "rank": 7
+    },
+    {
+      "name": "diff_gap2_peak_prominence",
+      "importance": 0.04259363762593605,
+      "rank": 8
+    },
+    {
+      "name": "spectral_centroid",
+      "importance": 0.03434200204100318,
+      "rank": 9
+    },
+    {
+      "name": "jerk_std",
+      "importance": 0.033598658814246056,
+      "rank": 10
+    },
+    {
+      "name": "diff_gap1_mean",
+      "importance": 0.033224486453659184,
+      "rank": 11
+    },
+    {
+      "name": "velocity_mean",
+      "importance": 0.031016606758952552,
+      "rank": 12
+    },
+    {
+      "name": "diff_gap2_mean",
+      "importance": 0.03024212687762802,
+      "rank": 13
+    },
+    {
+      "name": "acceleration_std",
+      "importance": 0.022219439727282925,
+      "rank": 14
+    },
+    {
+      "name": "diff_gap1_peak_prominence",
+      "importance": 0.02200113175123308,
+      "rank": 15
+    },
+    {
+      "name": "dct_dc",
+      "importance": 0.020545951299811696,
+      "rank": 16
+    },
+    {
+      "name": "edge_density_diff_mean",
+      "importance": 0.01858666744500184,
+      "rank": 17
+    },
+    {
+      "name": "ssim_mean",
+      "importance": 0.01813119735758401,
+      "rank": 18
+    },
+    {
+      "name": "diff_gap4_max",
+      "importance": 0.0175072836839408,
+      "rank": 19
+    },
+    {
+      "name": "color_moment_change_max",
+      "importance": 0.016280965991883067,
+      "rank": 20
+    },
+    {
+      "name": "diff_gap8_std",
+      "importance": 0.013986461814258175,
+      "rank": 21
+    },
+    {
+      "name": "autocorr_lag4",
+      "importance": 0.013689402279753406,
+      "rank": 22
+    },
+    {
+      "name": "diff_gap1_std",
+      "importance": 0.01344287319154106,
+      "rank": 23
+    },
+    {
+      "name": "autocorr_lag2",
+      "importance": 0.012915536173521558,
+      "rank": 24
+    },
+    {
+      "name": "flow_magnitude_mean",
+      "importance": 0.012553212958392852,
+      "rank": 25
+    },
+    {
+      "name": "texture_change_mean",
+      "importance": 0.011438882784044358,
+      "rank": 26
+    },
+    {
+      "name": "diff_gap4_peak_prominence",
+      "importance": 0.011370848679079573,
+      "rank": 27
+    },
+    {
+      "name": "flow_direction_change_max",
+      "importance": 0.011240938634922759,
+      "rank": 28
+    },
+    {
+      "name": "autocorr_lag1",
+      "importance": 0.010488685829725152,
+      "rank": 29
+    },
+    {
+      "name": "hsv_change_mean",
+      "importance": 0.010342841648338768,
+      "rank": 30
+    }
+  ],
+  "model_accuracy": 1.0
+}

@@ -1,0 +1,10 @@
+{
+  "analyses": [
+    {
+      "feature": "flow_consistency",
+      "gradual_mean": 0.7322577567398548,
+      "gradual_std": 0.12021102288067621,
+      "none_mean": 0.7527785802483559,
+      "none_std": 0.12312605669495162,
+      "separation": 0.16864959161876097,
+      "discriminative": 

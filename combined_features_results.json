@@ -1,0 +1,22 @@
+{
+  "metrics": {
+    "auc": 0.7657477678571429,
+    "precision": 0.678082191780822,
+    "recall": 0.7071428571428572,
+    "f1": 0.6923076923076923
+  },
+  "feature_importance": {
+    "content_emerge": -5.037675778429811,
+    "content\u00d7track": -2.937557689300867,
+    "spatial\u00d7bright": 2.380231117919213,
+    "trackability": 2.2085715171853617,
+    "motion_accum": -1.883653843824866,
+    "brightness_mono": 1.5077664067881862,
+    "spatial_variance": 1.42734641388686,
+    "change_accum": 1.3164705348084527,
+    "motion\u00d7layout": -1.3032997860279902,
+    "layout_stability": -1.2604752219470168,
+    "flow_consistency": -0.698974080637805
+  },
+  "num_features": 11
+}

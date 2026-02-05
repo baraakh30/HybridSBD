@@ -1,0 +1,11 @@
+{
+  "summary": {
+    "total": 2707,
+    "detected": 2104,
+    "missed": 603,
+    "detection_rate": 0.7772441817510158
+  },
+  "missed_graduals": [
+    {
+      "batch_idx": 160,
+      "start": 
