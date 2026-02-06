@@ -72,6 +72,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
     total_type_loss = 0
     total_reasoning_loss = 0
     total_consistency_loss = 0
+    total_gradual_length_loss = 0
     
     # Reasoning tracking (motion dynamics features)
     total_acceleration = 0
@@ -119,6 +120,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
         total_type_loss += loss_dict['type']
         total_reasoning_loss += loss_dict.get('reasoning', 0.0)
         total_consistency_loss += loss_dict.get('consistency', 0.0)
+        total_gradual_length_loss += loss_dict.get('gradual_length', 0.0)
         
         # Track reasoning scores (motion dynamics - monitor natural learning)
         with torch.no_grad():
@@ -156,6 +158,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
     avg_type = total_type_loss / len(train_loader)
     avg_reasoning = total_reasoning_loss / len(train_loader)
     avg_consistency = total_consistency_loss / len(train_loader)
+    avg_gradual_length = total_gradual_length_loss / len(train_loader)
     
     # Final epoch metrics
     final_precision = tp_boundary / (tp_boundary + fp_boundary + 1e-8)
@@ -168,6 +171,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
         'type_loss': avg_type,
         'reasoning_loss': avg_reasoning,
         'consistency_loss': avg_consistency,
+        'gradual_length_loss': avg_gradual_length,
         'boundary_f1': final_f1,
         'boundary_precision': final_precision,
         'boundary_recall': final_recall,
@@ -188,6 +192,7 @@ def validate(model, val_loader, criterion, device, config):
     total_type_loss = 0
     total_reasoning_loss = 0
     total_consistency_loss = 0
+    total_gradual_length_loss = 0
     
     # Reasoning tracking (motion dynamics - monitor discrimination)
     reasoning_stats = {
@@ -244,6 +249,7 @@ def validate(model, val_loader, criterion, device, config):
         
         total_reasoning_loss += loss_dict.get('reasoning', 0.0)
         total_consistency_loss += loss_dict.get('consistency', 0.0)
+        total_gradual_length_loss += loss_dict.get('gradual_length', 0.0)
         # Extract predictions
         boundary_probs = torch.sigmoid(boundary_logits.squeeze(-1))
         type_preds = torch.argmax(type_logits, dim=-1)
@@ -360,6 +366,7 @@ def validate(model, val_loader, criterion, device, config):
         'type_loss': total_type_loss / len(val_loader),
         'reasoning_loss': total_reasoning_loss / len(val_loader),
         'consistency_loss': total_consistency_loss / len(val_loader),
+        'gradual_length_loss': total_gradual_length_loss / len(val_loader),
         'reasoning': reasoning_summary,
         'gradual_confusion': gradual_confusion,
         'gradual_fp_sources': gradual_fp_sources
@@ -651,11 +658,10 @@ def main():
     config = {
         **BASE_CONFIG,  # Inherit all base config
         
-        # Model architecture
-        'main_dim': 384,  # Main processing dimension (fusion + detection)
-                          # Component dims are FIXED: spatial=256, hist=128, similarity=128
-                          # 384 gives ~10-12M params (sweet spot between TransNetV2 7M and AutoShot 15M)
-        'num_fusion_blocks': 4,  # Deeper fusion (TransNetV2 uses 3 DDCNN layers + fc)
+        # Model architecture (OPTIMIZED for ~10-12M params)
+        'main_dim': 256,  # Reduced from 384 to reduce params (was causing 22M params!)
+                          # 256 gives ~8-10M params (closer to TransNetV2's 7M)
+        'num_fusion_blocks': 3,  # Reduced from 4 (fewer blocks = fewer params)
         
         # Resume training
         'resume': args.resume,  # Path to checkpoint to resume from
@@ -679,9 +685,9 @@ def main():
         'focal_alpha': 0.85,  # Increased to help recall (0.80 too conservative)
         'focal_gamma': 2.0,   # Standard focal loss focusing
         'type_weight': 0.15,  # Reduced to let boundary head lead
-        'type_class_weights': [0.05, 10.0, 5.0],  # FIXED: balance 67.5:1:1.8 distribution
+        'type_class_weights': [1.0, 20.0, 10.0],  # FIXED: balance 67.5:1:1.8 distribution
         'reasoning_weight': 0.00,  # DISABLED: margin constraints too strict
-        'consistency_weight': 0.02,  # VERY LOW: avoid suppressing boundary head during early training
+        'consistency_weight': 0.20,  # VERY LOW: avoid suppressing boundary head during early training
         'boundary_threshold': 0.55,  # LOWERED to help detect subtle graduals
         
         # Data loading (OPTIMIZED - fix bottleneck!)
@@ -690,8 +696,8 @@ def main():
         'prefetch_factor': 4,  # INCREASED 2→4: pre-load more batches
         
         # Paths
-        'checkpoint_dir': 'outputs/hybrid_detector3',
-        'wandb_project': 'hybrid-boundary-detector3'
+        'checkpoint_dir': 'outputs/hybrid_detector4',
+        'wandb_project': 'hybrid-boundary-detector4'
     }
     
     # Apply command-line overrides
@@ -976,6 +982,7 @@ def main():
             'train/type_loss': train_metrics['type_loss'],
             'train/reasoning_loss': train_metrics['reasoning_loss'],
             'train/consistency_loss': train_metrics['consistency_loss'],
+            'train/gradual_length_loss': train_metrics.get('gradual_length_loss', 0.0),
             # Reasoning monitoring (motion dynamics - track discrimination)
             'train/reasoning_acceleration': train_metrics['reasoning/acceleration'],
             'train/reasoning_jerk': train_metrics['reasoning/jerk'],
@@ -984,6 +991,7 @@ def main():
             'val/type_loss': val_metrics['type_loss'],
             'val/reasoning_loss': val_metrics['reasoning_loss'],
             'val/consistency_loss': val_metrics['consistency_loss'],
+            'val/gradual_length_loss': val_metrics.get('gradual_length_loss', 0.0),
             'val/cut_f1': val_metrics['cut']['f1'],
             'val/cut_precision': val_metrics['cut']['precision'],
             'val/cut_recall': val_metrics['cut']['recall'],

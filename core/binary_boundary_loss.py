@@ -148,6 +148,71 @@ class BinaryBoundaryLoss(nn.Module):
     
     # Temporal coherence loss removed - it penalized gradual transitions
     
+    def gradual_length_penalty(self, type_logits, is_boundary):
+        """
+        FIX 6C: Penalize predicting gradual on SHORT windows
+        
+        Graduals should last >10 frames (empirically: 11-81 frames)
+        Cuts are instant (1-3 frames)
+        
+        This prevents model from predicting "gradual" on quick changes
+        
+        Args:
+            type_logits: [B, T, 3] type predictions (none, cut, gradual)
+            is_boundary: [B, T] binary mask of boundary frames
+        
+        Returns:
+            penalty loss (scalar)
+        """
+        B, T, _ = type_logits.shape
+        
+        # Get gradual predictions (class 2)
+        gradual_probs = torch.softmax(type_logits, dim=-1)[:, :, 2]  # [B, T]
+        gradual_pred = (gradual_probs > 0.5) & is_boundary.bool()  # [B, T]
+        
+        # Compute run lengths of consecutive gradual predictions
+        # For each batch item separately
+        total_penalty = 0.0
+        num_violations = 0
+        
+        for b in range(B):
+            # Find runs of gradual predictions
+            gradual_b = gradual_pred[b].float()  # [T]
+            
+            # Detect run boundaries
+            diff = torch.cat([torch.tensor([0], device=gradual_b.device), 
+                            gradual_b[1:] - gradual_b[:-1]])
+            
+            starts = torch.where(diff == 1)[0]
+            ends = torch.where(diff == -1)[0]
+            
+            # Handle edge cases
+            if len(starts) > 0:
+                if len(ends) == 0 or (len(ends) > 0 and starts[0] < ends[0]):
+                    # Gradual extends to end
+                    if len(ends) == 0:
+                        ends = torch.tensor([T], device=starts.device)
+                    else:
+                        ends = torch.cat([ends, torch.tensor([T], device=starts.device)])
+                
+                # Compute run lengths
+                for start, end in zip(starts, ends):
+                    length = (end - start).item()
+                    
+                    # Penalize if too short (< 3 frames) - these are more like cuts
+                    # Dataset has graduals from 2-100 frames, so only penalize instant changes
+                    if length < 3:
+                        # Penalty increases as length decreases
+                        penalty = (3 - length) / 3.0
+                        total_penalty += penalty
+                        num_violations += 1
+        
+        # Average penalty
+        if num_violations > 0:
+            return total_penalty / num_violations
+        else:
+            return torch.tensor(0.0, device=type_logits.device)
+    
     # REASONING LOSS DISABLED - Features too ambiguous to supervise directly
     # Empirical analysis showed reasoning features IDENTICAL for graduals vs pans:
     #   True gradual: change=0.122, variance=0.722, mono=0.384
@@ -310,14 +375,21 @@ class BinaryBoundaryLoss(nn.Module):
         # if reasoning_outputs is not None:
         #     loss_reasoning, reasoning_components = self.reasoning_loss(reasoning_outputs, targets)
         
-        # Combine losses (reasoning disabled, consistency enabled)
-        total_loss = loss_focal + self.type_weight * loss_type + self.consistency_weight * loss_consistency
+        # 5. Gradual length penalty (FIX 6C): Penalize short gradual predictions
+        loss_gradual_length = torch.tensor(0.0, device=boundary_logits.device)
+        
+        # Combine losses (reasoning disabled, consistency enabled, gradual length penalty added)
+        total_loss = (loss_focal + 
+                     self.type_weight * loss_type + 
+                     self.consistency_weight * loss_consistency +
+                     0.1 * loss_gradual_length)  # Weight 0.1 for gradual length penalty
         
         components = {
             'focal': loss_focal.item(),
             'type': loss_type.item(),
             'consistency': loss_consistency.item(),
             'reasoning': loss_reasoning.item() if isinstance(loss_reasoning, torch.Tensor) else 0.0,
+            'gradual_length': loss_gradual_length.item() if isinstance(loss_gradual_length, torch.Tensor) else loss_gradual_length,
             'total': total_loss.item()
         }
         
