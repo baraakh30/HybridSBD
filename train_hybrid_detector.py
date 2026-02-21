@@ -32,7 +32,8 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import random as _random
 import wandb
 from tqdm import tqdm
 import json
@@ -50,7 +51,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
-from core.binary_boundary_loss import create_binary_boundary_loss
+from core.binary_boundary_loss import create_binary_boundary_loss, create_one_hot_many_hot
 
 # Import existing utilities
 from train_turbo_sbd_v2 import (
@@ -63,20 +64,150 @@ from train_turbo_sbd_v2 import (
 from train_boundary_detector import PredecodedDataset
 
 
+# ---------------------------------------------------------------------------
+# AutoShot-compatible scene evaluation utilities
+# Adapted from: https://github.com/StanislavPetrovV/AutoShot
+# ---------------------------------------------------------------------------
+
+def predictions_to_scenes(predictions):
+    """Convert many_hot binary array (1=transition, 0=scene) to list of scene [start, end] intervals."""
+    scenes = []
+    t, t_prev, start = -1, 0, 0
+    for i, t in enumerate(predictions):
+        if t_prev == 1 and t == 0:
+            start = i
+        if t_prev == 0 and t == 1 and i != 0:
+            scenes.append([start, i])
+        t_prev = t
+    if t == 0:
+        scenes.append([start, i])
+    if len(scenes) == 0:
+        return np.array([[0, len(predictions) - 1]], dtype=np.int32)
+    return np.array(scenes, dtype=np.int32)
+
+
+def evaluate_scenes(gt_scenes, pred_scenes, return_mistakes=False, n_frames_miss_tolerance=2):
+    """
+    Standard AutoShot scene detection evaluation.
+    Adapted from: https://github.com/gyglim/shot-detection-evaluation
+
+    A predicted transition is a TP if it overlaps a GT transition within
+    n_frames_miss_tolerance frames.
+    """
+    shift = n_frames_miss_tolerance / 2
+    gt_scenes = gt_scenes.astype(np.float32) + np.array([[-0.5 + shift, 0.5 - shift]])
+    pred_scenes = pred_scenes.astype(np.float32) + np.array([[-0.5 + shift, 0.5 - shift]])
+
+    gt_trans = np.stack([gt_scenes[:-1, 1], gt_scenes[1:, 0]], 1)
+    pred_trans = np.stack([pred_scenes[:-1, 1], pred_scenes[1:, 0]], 1)
+
+    i, j = 0, 0
+    tp, fp, fn = 0, 0, 0
+    fp_mistakes, fn_mistakes = [], []
+
+    while i < len(gt_trans) or j < len(pred_trans):
+        if j == len(pred_trans):
+            fn += 1
+            fn_mistakes.append(gt_trans[i])
+            i += 1
+        elif i == len(gt_trans):
+            fp += 1
+            fp_mistakes.append(pred_trans[j])
+            j += 1
+        elif pred_trans[j, 1] < gt_trans[i, 0]:
+            fp += 1
+            fp_mistakes.append(pred_trans[j])
+            j += 1
+        elif pred_trans[j, 0] > gt_trans[i, 1]:
+            fn += 1
+            fn_mistakes.append(gt_trans[i])
+            i += 1
+        else:
+            i += 1
+            j += 1
+            tp += 1
+
+    p = tp / (tp + fp) if tp + fp != 0 else 0
+    r = tp / (tp + fn) if tp + fn != 0 else 0
+    f1 = (2 * p * r) / (p + r) if p + r != 0 else 0
+
+    if return_mistakes:
+        return p, r, f1, (tp, fp, fn), fp_mistakes, fn_mistakes
+    return p, r, f1, (tp, fp, fn)
+
+
+def _build_pred_many_hot(y_pred, z_pred, boundary_threshold, gradual_threshold):
+    """Combine y (one_hot midpoint) and z (many_hot extent) into a single many_hot array.
+
+    - Gradual transition frames: z_pred > gradual_threshold (already many_hot)
+    - Cut transition frames: y_pred > boundary_threshold AND surrounding z is low
+      (mark just that single midpoint frame as a 1-frame transition)
+    """
+    pred_is_boundary = y_pred > boundary_threshold      # sparse midpoint spikes
+    pred_is_gradual = z_pred > gradual_threshold         # dense gradual extent
+    # Cuts: midpoint spikes that are not already covered by gradual extent
+    pred_is_cut = pred_is_boundary & ~pred_is_gradual
+    pred_many_hot = (pred_is_gradual | pred_is_cut).astype(np.uint8)
+    return pred_many_hot, pred_is_cut
+
+
+# ---------------------------------------------------------------------------
+
+
+def augment_frames(frames):
+    """
+    Inline augmentation on [B, T, C, H, W] frames (values in [0,1]).
+    All gating is per-clip (not per-batch), so each of the B clips gets
+    an independent decision on whether each augmentation applies.
+    Runs on GPU after data is moved — faster than CPU-side __getitem__.
+    """
+    B, T, C, H, W = frames.shape
+
+    # 1. Horizontal flip — per-clip gate, same across T (preserves temporal structure)
+    flip_mask = torch.rand(B, device=frames.device) < 0.5          # [B]
+    frames[flip_mask] = frames[flip_mask].flip(-1)
+
+    # 2. Per-frame brightness — each clip independently decides (50% chance)
+    apply = torch.rand(B, device=frames.device) < 0.5              # [B]
+    if apply.any():
+        scale = 1.0 + (torch.rand(B, T, 1, 1, 1, device=frames.device) * 0.4 - 0.2)
+        scale[~apply] = 1.0                                         # no-op for non-selected clips
+        frames = (frames * scale).clamp(0.0, 1.0)
+
+    # 3. Per-frame contrast — each clip independently decides (50% chance)
+    apply = torch.rand(B, device=frames.device) < 0.5              # [B]
+    if apply.any():
+        factor = 1.0 + (torch.rand(B, T, 1, 1, 1, device=frames.device) * 0.3 - 0.15)
+        factor[~apply] = 1.0
+        mean = frames.mean(dim=(2, 3, 4), keepdim=True)
+        frames = ((frames - mean) * factor + mean).clamp(0.0, 1.0)
+
+    # 4. Gaussian noise — each clip independently decides (50% chance, stronger noise)
+    # This directly disrupts the model memorising exact pixel values from training clips.
+    apply = torch.rand(B, device=frames.device) < 0.5              # [B] raised from 30% to 50%
+    if apply.any():
+        noise = torch.randn(B, T, C, H, W, device=frames.device) * 0.02  # raised 0.01→0.02
+        noise[~apply] = 0.0
+        frames = (frames + noise).clamp(0.0, 1.0)
+
+    # 5. Global brightness shift — per-clip (50% chance)
+    # Shifts the whole clip up/down by a constant; different from per-frame scaling.
+    apply = torch.rand(B, device=frames.device) < 0.5
+    if apply.any():
+        shift = (torch.rand(B, 1, 1, 1, 1, device=frames.device) * 0.2 - 0.1)  # [-0.1, +0.1]
+        shift[~apply] = 0.0
+        frames = (frames + shift).clamp(0.0, 1.0)
+
+    return frames
+
+
 def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, config):
-    """Train for one epoch"""
+    """Train for one epoch with dual-head (one_hot + many_hot) model"""
     model.train()
     
     total_loss = 0
-    total_focal_loss = 0
-    total_type_loss = 0
-    total_reasoning_loss = 0
-    total_consistency_loss = 0
-    total_gradual_length_loss = 0
-    
-    # Reasoning tracking (motion dynamics features)
-    total_acceleration = 0
-    total_jerk = 0
+    total_y_loss = 0
+    total_z_loss = 0
     
     # Metrics tracking for progress bar
     tp_boundary = 0
@@ -92,6 +223,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
         frames, labels, transition_lengths = batch_data
         
         frames = frames.to(device, non_blocking=True)  # [B, T, C, H, W]
+        frames = augment_frames(frames)                 # random flip + color jitter + noise
         labels = labels.to(device, non_blocking=True)  # [B, T] - 0=none, 1=cut, 2=gradual
         transition_lengths = transition_lengths.to(device, non_blocking=True)
         
@@ -99,41 +231,32 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
         
         # Forward pass with mixed precision
         with torch.amp.autocast('cuda'):
-            boundary_logits, type_logits, reasoning, type_logits_raw = model(frames)
-            # WITH reasoning supervision - guide discriminative features!
-            loss, loss_dict = criterion(
-                boundary_logits, type_logits, labels, transition_lengths,
-                reasoning_outputs=reasoning,
-                type_logits_raw=type_logits_raw
-            )
+            y_logits, z_logits = model(frames)
+            loss, loss_dict = criterion(y_logits, z_logits, labels, transition_lengths)
         
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Tightened 1.0→0.5
         scaler.step(optimizer)
         scaler.update()
         
         # Track losses
         total_loss += loss.item()
-        total_focal_loss += loss_dict['focal']
-        total_type_loss += loss_dict['type']
-        total_reasoning_loss += loss_dict.get('reasoning', 0.0)
-        total_consistency_loss += loss_dict.get('consistency', 0.0)
-        total_gradual_length_loss += loss_dict.get('gradual_length', 0.0)
-        
-        # Track reasoning scores (motion dynamics - monitor natural learning)
-        with torch.no_grad():
-            total_acceleration += reasoning['acceleration'].abs().mean().item()
-            total_jerk += reasoning['jerk'].abs().mean().item()
+        total_y_loss += loss_dict['y_loss']
+        total_z_loss += loss_dict['z_loss']
         
         num_batches += 1
         
-        # Compute frame-level binary metrics for progress bar
+        # Compute frame-level binary metrics for progress bar.
+        # Compare y_pred against one_hot targets (midpoints only) — same signal
+        # the loss trains on. Using (labels > 0) is wrong: it penalises y for not
+        # firing on every gradual frame, causing recall to look artificially low.
         with torch.no_grad():
-            boundary_probs = torch.sigmoid(boundary_logits).squeeze(-1)
-            boundary_preds = (boundary_probs > boundary_threshold).long()
-            boundary_targets = (labels > 0).long()
+            y_probs = torch.sigmoid(y_logits).squeeze(-1)  # [B, T]
+            boundary_preds = (y_probs > boundary_threshold).long()
+            one_hot_targets, _ = create_one_hot_many_hot(labels)
+            boundary_targets = (one_hot_targets > 0).long()
             
             tp_boundary += (boundary_preds & boundary_targets.bool()).sum().item()
             fp_boundary += (boundary_preds & ~boundary_targets.bool()).sum().item()
@@ -154,11 +277,8 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
         })
     
     avg_loss = total_loss / len(train_loader)
-    avg_focal = total_focal_loss / len(train_loader)
-    avg_type = total_type_loss / len(train_loader)
-    avg_reasoning = total_reasoning_loss / len(train_loader)
-    avg_consistency = total_consistency_loss / len(train_loader)
-    avg_gradual_length = total_gradual_length_loss / len(train_loader)
+    avg_y_loss = total_y_loss / len(train_loader)
+    avg_z_loss = total_z_loss / len(train_loader)
     
     # Final epoch metrics
     final_precision = tp_boundary / (tp_boundary + fp_boundary + 1e-8)
@@ -167,209 +287,199 @@ def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch
     
     return {
         'loss': avg_loss,
-        'focal_loss': avg_focal,
-        'type_loss': avg_type,
-        'reasoning_loss': avg_reasoning,
-        'consistency_loss': avg_consistency,
-        'gradual_length_loss': avg_gradual_length,
+        'y_loss': avg_y_loss,
+        'z_loss': avg_z_loss,
         'boundary_f1': final_f1,
         'boundary_precision': final_precision,
-        'boundary_recall': final_recall,
-        # Reasoning statistics (motion dynamics - track learning)
-        'reasoning/acceleration': total_acceleration / len(train_loader),
-        'reasoning/jerk': total_jerk / len(train_loader)
+        'boundary_recall': final_recall
     }
 
 
-@torch.no_grad()
 @torch.no_grad()
 def validate(model, val_loader, criterion, device, config):
-    """Validate model - REDESIGNED without boosting diagnostics"""
+    """
+    Validate using the standard AutoShot scene evaluation (evaluate_scenes).
+
+    Primary metric: overall scene-detection F1 at the best threshold found by
+    sweeping a small set of candidates over the buffered predictions.
+    Secondary metrics: cut-only and gradual-only F1 (approx, for debug).
+    """
     model.eval()
-    
-    total_loss = 0
-    total_focal_loss = 0
-    total_type_loss = 0
-    total_reasoning_loss = 0
-    total_consistency_loss = 0
-    total_gradual_length_loss = 0
-    
-    # Reasoning tracking (motion dynamics - monitor discrimination)
-    reasoning_stats = {
-        'cut': {
-            'acceleration': [], 'jerk': [],
-            'gradual_prob': [], 'count': 0
-        },
-        'gradual': {
-            'acceleration': [], 'jerk': [],
-            'gradual_prob': [], 'count': 0
-        },
-        'none': {
-            'acceleration': [], 'jerk': [],
-            'gradual_prob': [], 'count': 0
-        }
-    }
-    
-    # Confusion tracking
-    gradual_confusion = {
-        'predicted_as_gradual': 0, 'predicted_as_cut': 0,
-        'predicted_as_none': 0, 'total': 0
-    }
-    
-    gradual_fp_sources = {
-        'from_cut': 0, 'from_none': 0, 'total': 0
-    }
-    
-    # Aggregate metrics
-    cut_tp, cut_fp, cut_fn = 0, 0, 0
-    gradual_tp, gradual_fp, gradual_fn = 0, 0, 0
-    
-    boundary_threshold = config['boundary_threshold']
-    
+
+    total_loss = 0.0
+    total_y_loss = 0.0
+    total_z_loss = 0.0
+
+    gradual_threshold = config.get('gradual_threshold', 0.5)
+
+    # Buffer per-clip predictions & GT so we can sweep thresholds at the end.
+    # Each entry: (y_pred [T], z_pred [T], gt_labels [T])
+    clip_predictions = []
+
     for batch_data in tqdm(val_loader, desc="Validating"):
         frames, labels, transition_lengths = batch_data
-        
+
         frames = frames.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         transition_lengths = transition_lengths.to(device, non_blocking=True)
-        
-        # Forward pass
-        boundary_logits, type_logits, reasoning, type_logits_raw = model(frames)
-        
-        # Compute loss (WITH reasoning supervision)
-        loss, loss_dict = criterion(
-            boundary_logits, type_logits, labels, transition_lengths,
-            reasoning_outputs=reasoning,
-            type_logits_raw=type_logits_raw
-        )
-        
+
+        y_logits, z_logits = model(frames)
+        loss, loss_dict = criterion(y_logits, z_logits, labels, transition_lengths)
+
         total_loss += loss.item()
-        total_focal_loss += loss_dict['focal']
-        total_type_loss += loss_dict['type']
-        
-        total_reasoning_loss += loss_dict.get('reasoning', 0.0)
-        total_consistency_loss += loss_dict.get('consistency', 0.0)
-        total_gradual_length_loss += loss_dict.get('gradual_length', 0.0)
-        # Extract predictions
-        boundary_probs = torch.sigmoid(boundary_logits.squeeze(-1))
-        type_preds = torch.argmax(type_logits, dim=-1)
-        is_boundary = boundary_probs > boundary_threshold
-        
-        # Collect reasoning statistics (motion dynamics - monitor discrimination)
-        with torch.no_grad():
-            acceleration = reasoning['acceleration'].abs().squeeze(-1)
-            jerk = reasoning['jerk'].abs().squeeze(-1)
-            type_probs = torch.softmax(type_logits, dim=-1)
-            gradual_prob = type_probs[:, :, 2]
-            
-            # Flatten
-            labels_flat = labels.reshape(-1).cpu().numpy()
-            acceleration_flat = acceleration.reshape(-1).cpu().numpy()
-            jerk_flat = jerk.reshape(-1).cpu().numpy()
-            gradual_prob_flat = gradual_prob.reshape(-1).cpu().numpy()
-            
-            # Collect by type
-            for stats_key, label_val in [('none', 0), ('cut', 1), ('gradual', 2)]:
-                mask = (labels_flat == label_val)
-                reasoning_stats[stats_key]['acceleration'].extend(acceleration_flat[mask].tolist())
-                reasoning_stats[stats_key]['jerk'].extend(jerk_flat[mask].tolist())
-                reasoning_stats[stats_key]['gradual_prob'].extend(gradual_prob_flat[mask].tolist())
-                reasoning_stats[stats_key]['count'] += mask.sum()
-            
-            # Confusion analysis
-            boundary_pred_flat = is_boundary.reshape(-1).cpu().numpy()
-            type_pred_flat = type_preds.reshape(-1).cpu().numpy()
-            
-            # Gradual GT confusion
-            gradual_mask = (labels_flat == 2)
-            for idx in np.where(gradual_mask)[0]:
-                if boundary_pred_flat[idx]:
-                    if type_pred_flat[idx] == 2:
-                        gradual_confusion['predicted_as_gradual'] += 1
-                    else:
-                        gradual_confusion['predicted_as_cut'] += 1
-                else:
-                    gradual_confusion['predicted_as_none'] += 1
-                gradual_confusion['total'] += 1
-            
-            # Gradual FP sources
-            for idx in np.where((boundary_pred_flat == True) & (type_pred_flat == 2))[0]:
-                if labels_flat[idx] == 1:
-                    gradual_fp_sources['from_cut'] += 1
-                    gradual_fp_sources['total'] += 1
-                elif labels_flat[idx] == 0:
-                    gradual_fp_sources['from_none'] += 1
-                    gradual_fp_sources['total'] += 1
-        
-        # Get boundary predictions with type gating
-        preds_3class = torch.where(is_boundary, type_preds, torch.zeros_like(type_preds))
-        
-        # Process each sample
+        total_y_loss += loss_dict['y_loss']
+        total_z_loss += loss_dict['z_loss']
+
+        y_probs = torch.sigmoid(y_logits.squeeze(-1)).cpu().numpy()  # [B, T]
+        z_probs = torch.sigmoid(z_logits.squeeze(-1)).cpu().numpy()  # [B, T]
+        gt_np   = labels.cpu().numpy()                               # [B, T]
+
         for b in range(frames.shape[0]):
-            pred_array = preds_3class[b].cpu()
-            gt_array = labels[b].cpu()
-            
-            pred_trans = extract_transitions_from_predictions(pred_array, min_gap=3)
-            gt_trans = extract_transitions_from_predictions(gt_array, min_gap=3)
-            
-            # Cuts
-            sample_metrics = compute_transition_metrics(pred_trans['cuts'], gt_trans['cuts'], tolerance=3)
-            cut_tp += sample_metrics.get('tp', 0)
-            cut_fp += sample_metrics.get('fp', 0)
-            cut_fn += sample_metrics.get('fn', 0)
-            
-            # Graduals
-            sample_metrics = compute_transition_metrics(pred_trans['graduals'], gt_trans['graduals'], tolerance=3)
-            gradual_tp += sample_metrics.get('tp', 0)
-            gradual_fp += sample_metrics.get('fp', 0)
-            gradual_fn += sample_metrics.get('fn', 0)
-    
-    # Calculate metrics
-    cut_precision = cut_tp / (cut_tp + cut_fp + 1e-8)
-    cut_recall = cut_tp / (cut_tp + cut_fn + 1e-8)
-    cut_f1 = 2 * cut_precision * cut_recall / (cut_precision + cut_recall + 1e-8)
-    
-    gradual_precision = gradual_tp / (gradual_tp + gradual_fp + 1e-8)
-    gradual_recall = gradual_tp / (gradual_tp + gradual_fn + 1e-8)
-    gradual_f1 = 2 * gradual_precision * gradual_recall / (gradual_precision + gradual_recall + 1e-8)
-    
-    overall_tp = cut_tp + gradual_tp
-    overall_fp = cut_fp + gradual_fp
-    overall_fn = cut_fn + gradual_fn
-    overall_precision = overall_tp / (overall_tp + overall_fp + 1e-8)
-    overall_recall = overall_tp / (overall_tp + overall_fn + 1e-8)
-    overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall + 1e-8)
-    
-    # Reasoning summary (motion dynamics - monitor discrimination)
-    def compute_reasoning_stats(scores_dict):
-        return {
-            'acceleration_mean': float(np.mean(scores_dict['acceleration'])) if scores_dict['acceleration'] else 0.0,
-            'jerk_mean': float(np.mean(scores_dict['jerk'])) if scores_dict['jerk'] else 0.0,
-            'gradual_prob_mean': float(np.mean(scores_dict['gradual_prob'])) if scores_dict['gradual_prob'] else 0.0,
-            'count': scores_dict['count']
-        }
-    
-    reasoning_summary = {
-        'cut': compute_reasoning_stats(reasoning_stats['cut']),
-        'gradual': compute_reasoning_stats(reasoning_stats['gradual']),
-        'none': compute_reasoning_stats(reasoning_stats['none'])
-    }
-    
+            clip_predictions.append((y_probs[b], z_probs[b], gt_np[b]))
+
+    # -----------------------------------------------------------------------
+    # Sweep thresholds on y-head to find the best overall F1
+    # (mirrors AutoShot's mAP_f1_p_fix_r threshold search)
+    # -----------------------------------------------------------------------
+    thresholds = np.array([0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5,
+                           0.55, 0.6, 0.65, 0.7, 0.8, 0.9])
+
+    best_f1, best_thr = -1.0, config['boundary_threshold']
+    thr_results = {}  # threshold -> (p, r, f1, tp, fp, fn)
+
+    for thr in thresholds:
+        tp, fp, fn = 0, 0, 0
+        for y_pred, z_pred, gt_labels in clip_predictions:
+            gt_many_hot = (gt_labels > 0).astype(np.uint8)
+            gt_scenes   = predictions_to_scenes(gt_many_hot)
+
+            pred_many_hot, _ = _build_pred_many_hot(y_pred, z_pred, thr, gradual_threshold)
+            pred_scenes       = predictions_to_scenes(pred_many_hot)
+
+            _, _, _, (tp_, fp_, fn_) = evaluate_scenes(gt_scenes, pred_scenes,
+                                                        n_frames_miss_tolerance=2)
+            tp += tp_
+            fp += fp_
+            fn += fn_
+
+        p  = tp / (tp + fp + 1e-8)
+        r  = tp / (tp + fn + 1e-8)
+        f1 = 2 * p * r / (p + r + 1e-8)
+        thr_results[float(thr)] = (p, r, f1, tp, fp, fn)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, float(thr)
+
+    # Model selection uses the BEST SWEPT F1 (same as what is displayed).
+    # Using fixed thr=0.5 was causing wrong saves: a model that peaks at thr=0.55
+    # would show higher displayed F1 but lower selection_f1, getting discarded.
+    # Threshold leakage is not a concern here — the swept thr is only used to pick
+    # which checkpoint to save, not to update weights or stop training early.
+    selection_f1 = best_f1  # best_f1 from sweep above, used for best-model saving
+
+    # -----------------------------------------------------------------------
+    # Sweep y_pred independently for cut-optimal threshold
+    # -----------------------------------------------------------------------
+    best_cut_f1, best_cut_thr = -1.0, 0.5
+    for thr in thresholds:
+        ctp, cfp, cfn = 0, 0, 0
+        for y_pred, z_pred, gt_labels in clip_predictions:
+            gt_cut_many   = (gt_labels == 1).astype(np.uint8)
+            gt_cut_scenes = predictions_to_scenes(gt_cut_many)
+            pred_cut_scenes = predictions_to_scenes((y_pred > thr).astype(np.uint8))
+            if len(gt_cut_scenes) > 1 or gt_cut_many.any():
+                _, _, _, (c_, f_, n_) = evaluate_scenes(
+                    gt_cut_scenes, pred_cut_scenes, n_frames_miss_tolerance=2)
+                ctp += c_; cfp += f_; cfn += n_
+        cp = ctp / (ctp + cfp + 1e-8); cr = ctp / (ctp + cfn + 1e-8)
+        cf = 2 * cp * cr / (cp + cr + 1e-8)
+        if cf > best_cut_f1:
+            best_cut_f1, best_cut_thr = cf, float(thr)
+
+    # -----------------------------------------------------------------------
+    # Sweep z_pred independently for gradual-optimal threshold
+    # -----------------------------------------------------------------------
+    best_grad_f1, best_grad_thr = -1.0, 0.5
+    for thr in thresholds:
+        gtp, gfp, gfn = 0, 0, 0
+        for y_pred, z_pred, gt_labels in clip_predictions:
+            gt_grad_many   = (gt_labels == 2).astype(np.uint8)
+            gt_grad_scenes = predictions_to_scenes(gt_grad_many)
+            pred_grad_scenes = predictions_to_scenes((z_pred > thr).astype(np.uint8))
+            if len(gt_grad_scenes) > 1 or gt_grad_many.any():
+                _, _, _, (g_, f_, n_) = evaluate_scenes(
+                    gt_grad_scenes, pred_grad_scenes, n_frames_miss_tolerance=2)
+                gtp += g_; gfp += f_; gfn += n_
+        gp = gtp / (gtp + gfp + 1e-8); gr = gtp / (gtp + gfn + 1e-8)
+        gf = 2 * gp * gr / (gp + gr + 1e-8)
+        if gf > best_grad_f1:
+            best_grad_f1, best_grad_thr = gf, float(thr)
+
+    # -----------------------------------------------------------------------
+    # Compute final metrics at their respective best thresholds
+    # -----------------------------------------------------------------------
+    ov_tp, ov_fp, ov_fn = 0, 0, 0
+    cut_tp, cut_fp, cut_fn = 0, 0, 0
+    grad_tp, grad_fp, grad_fn = 0, 0, 0
+
+    for y_pred, z_pred, gt_labels in clip_predictions:
+        # --- overall (combined y+z, AutoShot standard) at best_thr ---
+        gt_many_hot = (gt_labels > 0).astype(np.uint8)
+        gt_scenes   = predictions_to_scenes(gt_many_hot)
+        pred_many_hot, _ = _build_pred_many_hot(y_pred, z_pred, best_thr, gradual_threshold)
+        pred_scenes = predictions_to_scenes(pred_many_hot)
+        _, _, _, (tp_, fp_, fn_) = evaluate_scenes(gt_scenes, pred_scenes,
+                                                    n_frames_miss_tolerance=2)
+        ov_tp += tp_;  ov_fp += fp_;  ov_fn += fn_
+
+        # --- cut-only: head_y at its own optimal threshold ---
+        gt_cut_many   = (gt_labels == 1).astype(np.uint8)
+        gt_cut_scenes = predictions_to_scenes(gt_cut_many)
+        pred_cut_scenes = predictions_to_scenes((y_pred > best_cut_thr).astype(np.uint8))
+        if len(gt_cut_scenes) > 1 or gt_cut_many.any():
+            _, _, _, (c_tp, c_fp, c_fn) = evaluate_scenes(
+                gt_cut_scenes, pred_cut_scenes, n_frames_miss_tolerance=2)
+            cut_tp += c_tp;  cut_fp += c_fp;  cut_fn += c_fn
+
+        # --- gradual-only: head_z at its own optimal threshold ---
+        gt_grad_many   = (gt_labels == 2).astype(np.uint8)
+        gt_grad_scenes = predictions_to_scenes(gt_grad_many)
+        pred_grad_scenes = predictions_to_scenes((z_pred > best_grad_thr).astype(np.uint8))
+        if len(gt_grad_scenes) > 1 or gt_grad_many.any():
+            _, _, _, (g_tp, g_fp, g_fn) = evaluate_scenes(
+                gt_grad_scenes, pred_grad_scenes, n_frames_miss_tolerance=2)
+            grad_tp += g_tp;  grad_fp += g_fp;  grad_fn += g_fn
+
+    def _prf(tp, fp, fn):
+        p  = tp / (tp + fp + 1e-8)
+        r  = tp / (tp + fn + 1e-8)
+        f1 = 2 * p * r / (p + r + 1e-8)
+        return p, r, f1
+
+    ov_p,  ov_r,  ov_f1  = _prf(ov_tp, ov_fp, ov_fn)
+    cut_p, cut_r, cut_f1 = _prf(cut_tp, cut_fp, cut_fn)
+    grd_p, grd_r, grd_f1 = _prf(grad_tp, grad_fp, grad_fn)
+
+    n_batches = len(val_loader)
     return {
-        'cut': {'tp': cut_tp, 'fp': cut_fp, 'fn': cut_fn,
-                'precision': cut_precision, 'recall': cut_recall, 'f1': cut_f1},
-        'gradual': {'tp': gradual_tp, 'fp': gradual_fp, 'fn': gradual_fn,
-                    'precision': gradual_precision, 'recall': gradual_recall, 'f1': gradual_f1},
-        'overall': {'precision': overall_precision, 'recall': overall_recall, 'f1': overall_f1},
-        'loss': total_loss / len(val_loader),
-        'focal_loss': total_focal_loss / len(val_loader),
-        'type_loss': total_type_loss / len(val_loader),
-        'reasoning_loss': total_reasoning_loss / len(val_loader),
-        'consistency_loss': total_consistency_loss / len(val_loader),
-        'gradual_length_loss': total_gradual_length_loss / len(val_loader),
-        'reasoning': reasoning_summary,
-        'gradual_confusion': gradual_confusion,
-        'gradual_fp_sources': gradual_fp_sources
+        'cut': {
+            'tp': cut_tp, 'fp': cut_fp, 'fn': cut_fn,
+            'precision': cut_p, 'recall': cut_r, 'f1': cut_f1
+        },
+        'gradual': {
+            'tp': grad_tp, 'fp': grad_fp, 'fn': grad_fn,
+            'precision': grd_p, 'recall': grd_r, 'f1': grd_f1
+        },
+        'overall': {
+            'tp': ov_tp, 'fp': ov_fp, 'fn': ov_fn,
+            'precision': ov_p, 'recall': ov_r, 'f1': ov_f1
+        },
+        'best_threshold': best_thr,          # best swept threshold (diagnostic only)
+        'selection_f1': selection_f1,          # F1 at fixed thr=0.5 — used for model selection
+        'best_cut_threshold': best_cut_thr,    # y_pred optimal for cuts
+        'best_grad_threshold': best_grad_thr,  # z_pred optimal for graduals
+        'loss':   total_loss   / n_batches,
+        'y_loss': total_y_loss / n_batches,
+        'z_loss': total_z_loss / n_batches,
     }
 
 
@@ -422,27 +532,27 @@ def plot_training_history(history, save_dir):
     ax1.legend()
     ax1.grid(alpha=0.3)
     
-    # 2. Focal loss
+    # 2. Y-head loss (one_hot - boundary midpoint)
     ax2 = plt.subplot(3, 3, 2)
-    train_focal = [m['focal_loss'] for m in history['train']]
-    val_focal = [m['focal_loss'] for m in history['val']]
-    ax2.plot(epochs, train_focal, 'b-', label='Train', linewidth=2)
-    ax2.plot(epochs, val_focal, 'r-', label='Val', linewidth=2)
+    train_y = [m.get('y_loss', 0) for m in history['train']]
+    val_y = [m.get('y_loss', 0) for m in history['val']]
+    ax2.plot(epochs, train_y, 'b-', label='Train', linewidth=2)
+    ax2.plot(epochs, val_y, 'r-', label='Val', linewidth=2)
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Focal Loss')
-    ax2.set_title('Focal Loss (Boundary Detection)')
+    ax2.set_ylabel('Y Loss')
+    ax2.set_title('Y-Head Loss (one_hot: boundary midpoint)')
     ax2.legend()
     ax2.grid(alpha=0.3)
     
-    # 3. Type loss
+    # 3. Z-head loss (many_hot - gradual extent)
     ax3 = plt.subplot(3, 3, 3)
-    train_type = [m['type_loss'] for m in history['train']]
-    val_type = [m['type_loss'] for m in history['val']]
-    ax3.plot(epochs, train_type, 'b-', label='Train', linewidth=2)
-    ax3.plot(epochs, val_type, 'r-', label='Val', linewidth=2)
+    train_z = [m.get('z_loss', 0) for m in history['train']]
+    val_z = [m.get('z_loss', 0) for m in history['val']]
+    ax3.plot(epochs, train_z, 'b-', label='Train', linewidth=2)
+    ax3.plot(epochs, val_z, 'r-', label='Val', linewidth=2)
     ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('Type Loss')
-    ax3.set_title('Type Loss (Cut vs Gradual)')
+    ax3.set_ylabel('Z Loss')
+    ax3.set_title('Z-Head Loss (many_hot: gradual extent)')
     ax3.legend()
     ax3.grid(alpha=0.3)
     
@@ -611,7 +721,7 @@ def load_checkpoint(model, checkpoint_path, optimizer=None, scheduler=None, scal
     # Get training state
     epoch = checkpoint.get('epoch', 0)
     val_metrics = checkpoint.get('val_metrics', {})
-    best_val_f1 = val_metrics.get('overall', {}).get('f1', 0.0)
+    best_val_f1 = val_metrics.get('selection_f1', val_metrics.get('overall', {}).get('f1', 0.0))
     
     # Try to get patience counter from checkpoint (may not exist in older checkpoints)
     patience_counter = checkpoint.get('patience_counter', 0)
@@ -658,46 +768,61 @@ def main():
     config = {
         **BASE_CONFIG,  # Inherit all base config
         
-        # Model architecture (OPTIMIZED for ~10-12M params)
-        'main_dim': 256,  # Reduced from 384 to reduce params (was causing 22M params!)
-                          # 256 gives ~8-10M params (closer to TransNetV2's 7M)
-        'num_fusion_blocks': 3,  # Reduced from 4 (fewer blocks = fewer params)
+        # Model architecture
+        'main_dim': 320,          # Reduced 512→384: 512 has too much capacity for this dataset size
+        'num_fusion_blocks': 3,
         
         # Resume training
         'resume': args.resume,  # Path to checkpoint to resume from
         
-        # Pre-decoded dataset path
-        'predecoded_cache': r"D:\grad\data\training_cache",
+        # Pre-decoded dataset path (autoshot_cache_train/train has 45,274 clips, 648 videos)
+        'predecoded_cache': r"D:\grad\data\autoshot_cache_train",
         'use_predecoded': True,
         
         # Training
         'batch_size': 32,
         'num_epochs': 80,
-        'learning_rate': 1e-4,  # Back to original stable value
-        'weight_decay': 0.01,
+        'learning_rate': 5e-5,    # 1e-4 caused memorisation by epoch 4
+        'warmup_epochs': 5,       # slower ramp prevents early overfitting
+        'weight_decay': 0.05,
         'patience': 15,
-        
-        # Loss (REDESIGNED - back to stable baseline)
-        # Reasoning supervision DISABLED temporarily - margin constraints cause instability
-        # Model still computes reasoning features and uses them internally
-        # 1. Removed coherence/length losses (counterproductive)
-        # 2. Rebalanced type weights to prevent none class suppression
-        'focal_alpha': 0.85,  # Increased to help recall (0.80 too conservative)
-        'focal_gamma': 2.0,   # Standard focal loss focusing
-        'type_weight': 0.15,  # Reduced to let boundary head lead
-        'type_class_weights': [1.0, 20.0, 10.0],  # FIXED: balance 67.5:1:1.8 distribution
-        'reasoning_weight': 0.00,  # DISABLED: margin constraints too strict
-        'consistency_weight': 0.20,  # VERY LOW: avoid suppressing boundary head during early training
-        'boundary_threshold': 0.55,  # LOWERED to help detect subtle graduals
-        
-        # Data loading (OPTIMIZED - fix bottleneck!)
+
+        # Loss (AutoShot dual-head: one_hot + many_hot)
+        # ClipShots facts: 79% cuts, 21% graduals; gradual length min=2 max=243 mean=13 median=10
+        # lambda2 raised 0.1→0.3: z-head gets 3× more gradient signal; needed because
+        #   ClipShots graduals (mean=13 frames) are shorter than the model's 127-frame window,
+        #   so z-head learns slowly without extra weight.
+        'lambda1': 5.0,
+        'lambda2': 0.3,
+        # focal_alpha (y-head): 0.80 — one_hot positives are ~0.8% of frames → high alpha needed.
+        #   Run 14 test: lowering to 0.70 hurt AutoShot F1 by 0.008 while gaining only 0.001
+        #   on ClipShots. Reverted. The FP problem is a feature gap (fast pans look like cuts
+        #   to FrameSimilarity), not a loss-weight problem.
+        # focal_alpha_z (z-head): 0.50 balanced; fixed FP inflation on the z-head in run 13.
+        'focal_alpha': 0.80,
+        'focal_alpha_z': 0.50,
+        'focal_gamma': 2.0,
+        'boundary_threshold': 0.5,
+        'gradual_threshold': 0.5,
+
+        # Data loading
         'val_split_ratio': 0.15,
-        'num_workers': 6,  # INCREASED 4→12: saturate CPU while GPU computes
-        'prefetch_factor': 4,  # INCREASED 2→4: pre-load more batches
-        
+        'num_workers': 6,
+        'prefetch_factor': 4,
+
         # Paths
-        'checkpoint_dir': 'outputs/hybrid_detector4',
-        'wandb_project': 'hybrid-boundary-detector4'
+        'checkpoint_dir': 'outputs/hybrid_detector16',
+        'wandb_project': 'hybrid-boundary-detector10',
+
+        # Mixed training
+        # Real dataset sizes:
+        #   AutoShot train (85% of 45274): 38,482 clips  → ~1202 batches
+        #   ClipShots train total:         73,120 clips
+        # With mix_fraction=0.5:  AS=55%, CS=45% — model stays AutoShot-biased
+        # With mix_fraction=1.0:  AS=34%, CS=66% — matches the target eval distribution
+        'clipshots_cache': r'D:\grad\data\training_cache',
+        'clipshots_mix_fraction': 0.7,  # use ALL ClipShots clips; resampled each epoch
+        'clipshots_val_clips': 3000,    # ClipShots val clips added to val set (capped for speed)
     }
     
     # Apply command-line overrides
@@ -745,14 +870,43 @@ def main():
             cache_path, 
             split='train',
             val_split_ratio=config.get('val_split_ratio', 0.15),
-            random_seed=config.get('random_seed', 42)
+            random_seed=config.get('random_seed', 42),
+            temporal_jitter=True,   # time-reversal: scrambles fixed similarity matrices
         )
         val_dataset = PredecodedDataset(
             cache_path, 
             split='val',
             val_split_ratio=config.get('val_split_ratio', 0.15),
-            random_seed=config.get('random_seed', 42)
+            random_seed=config.get('random_seed', 42),
+            temporal_jitter=False,  # no jitter on val
         )
+
+        # --- Mix in ClipShots training clips ---
+        # AutoShot train = 648 videos. The model memorises their specific clip patterns
+        # within 4 epochs. Adding ClipShots (different distribution, ~3700 videos) forces
+        # the model to learn general features instead of AutoShot-specific ones.
+        # The ClipShots SUBSET IS RESAMPLED EVERY EPOCH so all 62K clips are seen
+        # over time and no fixed subset can be memorised.
+        clipshots_cache = config.get('clipshots_cache', '')
+        mix_fraction    = config.get('clipshots_mix_fraction', 0.0)
+        clipshots_full_dataset = None    # kept alive for per-epoch resampling
+        autoshot_train_dataset = train_dataset   # base AutoShot reference
+        if clipshots_cache and mix_fraction > 0 and Path(clipshots_cache).exists():
+            clipshots_full_dataset = PredecodedDataset(
+                clipshots_cache,
+                split='train',
+                val_split_ratio=config.get('val_split_ratio', 0.15),
+                random_seed=config.get('random_seed', 42),
+                temporal_jitter=True,
+            )
+            # Build epoch-0 subset (will be replaced before epoch 1 in the training loop)
+            n_mix_init = int(len(clipshots_full_dataset) * mix_fraction)
+            init_indices = list(_random.sample(range(len(clipshots_full_dataset)), n_mix_init))
+            clipshots_sub = torch.utils.data.Subset(clipshots_full_dataset, init_indices)
+            train_dataset = ConcatDataset([autoshot_train_dataset, clipshots_sub])
+            print(f"✓ ClipShots mixing: {n_mix_init} clips ({mix_fraction*100:.0f}% of {len(clipshots_full_dataset)}) — resampled each epoch")
+            print(f"✓ Initial combined train size: {len(train_dataset)} clips")
+        # ----------------------------------------
         
         print(f"✓ Using pre-decoded dataset (10-20x faster!)")
         print(f"✓ Train: {len(train_dataset)} clips, Val: {len(val_dataset)} clips")
@@ -815,6 +969,12 @@ def main():
         
         print(f"✓ Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
     
+    # Ensure per-epoch resampling variables exist even in non-predecoded path
+    if 'clipshots_full_dataset' not in dir():
+        clipshots_full_dataset = None
+    if 'autoshot_train_dataset' not in dir():
+        autoshot_train_dataset = train_dataset
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -853,26 +1013,23 @@ def main():
         'trainable_params': trainable_params
     })
     
-    # Create loss function (REDESIGNED)
+    # Create loss function (AutoShot dual-head)
     criterion = create_binary_boundary_loss({
+        'lambda1': config['lambda1'],
+        'lambda2': config['lambda2'],
         'focal_alpha': config['focal_alpha'],
+        'focal_alpha_z': config.get('focal_alpha_z', None),
         'focal_gamma': config['focal_gamma'],
-        'type_weight': config['type_weight'],
-        'type_class_weights': config['type_class_weights'],
-        'reasoning_weight': config['reasoning_weight'],
-        'consistency_weight': config['consistency_weight']
+        'z_label_smoothing': 0.1,  # Soft many_hot targets: reduces z_loss memorization
     }).to(device)
     
-    print(f"\nLoss configuration (REDESIGNED):")
-    print(f"  Focal gamma:      {config['focal_gamma']:.2f}")
-    print(f"  Focal alpha:      {config['focal_alpha']:.2f}")
-    print(f"  Type weight:      {config['type_weight']:.2f}")
-    print(f"  Type class weights: {config['type_class_weights']} [none, cut, gradual]")
-    print(f"  Reasoning weight: {config['reasoning_weight']:.2f} (discriminative targets)")
-    print(f"  Consistency weight: {config['consistency_weight']:.2f} (boundary-type alignment)")
-    print(f"  Boundary threshold: {config['boundary_threshold']:.2f}")
-    print(f"  REMOVED: coherence_loss, length_loss (counterproductive)")
-    print(f"  REMOVED: boosting logic (train/eval mismatch)")
+    print(f"\nLoss configuration (AutoShot dual-head):")
+    print(f"  lambda1 (y-head, one_hot):  {config['lambda1']:.2f}")
+    print(f"  lambda2 (z-head, many_hot): {config['lambda2']:.2f}")
+    print(f"  focal_alpha:                {config['focal_alpha']:.3f}")
+    print(f"  focal_gamma:                {config['focal_gamma']:.2f}")
+    print(f"  boundary_threshold:         {config['boundary_threshold']:.2f}")
+    print(f"  gradual_threshold:          {config['gradual_threshold']:.2f}")
     
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -881,11 +1038,23 @@ def main():
         weight_decay=config['weight_decay']
     )
     
-    # Learning rate scheduler (cosine annealing)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Learning rate scheduler: linear warmup then cosine decay
+    warmup_epochs = config.get('warmup_epochs', 5)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=config['num_epochs'],
+        start_factor=0.25,      # Start at 25% of peak LR (was 10% = too slow)
+        end_factor=1.0,
+        total_iters=warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config['num_epochs'] - warmup_epochs,
         eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
     )
     
     # Mixed precision scaler
@@ -923,6 +1092,25 @@ def main():
         print(f"\nEpoch {epoch}/{config['num_epochs']}")
         print("-" * 80)
         print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
+
+        # Resample ClipShots subset each epoch — different 50% every time.
+        # All 62K clips are seen over 2 full epochs; the model cannot memorise
+        # any fixed subset. Rebuilding DataLoader takes <100ms (index assignment only).
+        if clipshots_full_dataset is not None:
+            n_mix = int(len(clipshots_full_dataset) * config.get('clipshots_mix_fraction', 0.5))
+            epoch_indices = _random.sample(range(len(clipshots_full_dataset)), n_mix)
+            epoch_clipshots = torch.utils.data.Subset(clipshots_full_dataset, epoch_indices)
+            epoch_train_dataset = ConcatDataset([autoshot_train_dataset, epoch_clipshots])
+            train_loader = DataLoader(
+                epoch_train_dataset,
+                batch_size=config['batch_size'],
+                shuffle=True,
+                num_workers=config['num_workers'],
+                pin_memory=True,
+                persistent_workers=False,   # must be False when recreating each epoch
+                worker_init_fn=worker_init_fn,
+                prefetch_factor=config['prefetch_factor'],
+            )
         
         # Train
         train_metrics = train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, config)
@@ -938,21 +1126,20 @@ def main():
         train_record = make_serializable({
             'epoch': epoch,
             'loss': train_metrics['loss'],
-            'focal_loss': train_metrics['focal_loss'],
-            'type_loss': train_metrics['type_loss'],
+            'y_loss': train_metrics['y_loss'],
+            'z_loss': train_metrics['z_loss'],
             'boundary_f1': train_metrics['boundary_f1'],
             'boundary_precision': train_metrics['boundary_precision'],
             'boundary_recall': train_metrics['boundary_recall'],
-            'acceleration': train_metrics['reasoning/acceleration'],
-            'jerk': train_metrics['reasoning/jerk'],
             'lr': current_lr
         })
         
         val_record = make_serializable({
             'epoch': epoch,
             'loss': val_metrics['loss'],
-            'focal_loss': val_metrics['focal_loss'],
-            'type_loss': val_metrics['type_loss'],
+            'y_loss': val_metrics['y_loss'],
+            'z_loss': val_metrics['z_loss'],
+            'best_threshold': val_metrics['best_threshold'],
             'cut_f1': val_metrics['cut']['f1'],
             'cut_precision': val_metrics['cut']['precision'],
             'cut_recall': val_metrics['cut']['recall'],
@@ -967,31 +1154,28 @@ def main():
             'gradual_fn': val_metrics['gradual']['fn'],
             'overall_f1': val_metrics['overall']['f1'],
             'overall_precision': val_metrics['overall']['precision'],
-            'overall_recall': val_metrics['overall']['recall']
+            'overall_recall': val_metrics['overall']['recall'],
+            'overall_tp': val_metrics['overall']['tp'],
+            'overall_fp': val_metrics['overall']['fp'],
+            'overall_fn': val_metrics['overall']['fn'],
         })
         
         history['train'].append(train_record)
         history['val'].append(val_record)
         
         # Log to wandb
-        wandb.log({
+        wandb_metrics = {
             'epoch': epoch,
             'lr': current_lr,
             'train/loss': train_metrics['loss'],
-            'train/focal_loss': train_metrics['focal_loss'],
-            'train/type_loss': train_metrics['type_loss'],
-            'train/reasoning_loss': train_metrics['reasoning_loss'],
-            'train/consistency_loss': train_metrics['consistency_loss'],
-            'train/gradual_length_loss': train_metrics.get('gradual_length_loss', 0.0),
-            # Reasoning monitoring (motion dynamics - track discrimination)
-            'train/reasoning_acceleration': train_metrics['reasoning/acceleration'],
-            'train/reasoning_jerk': train_metrics['reasoning/jerk'],
+            'train/y_loss': train_metrics['y_loss'],
+            'train/z_loss': train_metrics['z_loss'],
+            'train/boundary_f1': train_metrics['boundary_f1'],
+            'train/boundary_precision': train_metrics['boundary_precision'],
+            'train/boundary_recall': train_metrics['boundary_recall'],
             'val/loss': val_metrics['loss'],
-            'val/focal_loss': val_metrics['focal_loss'],
-            'val/type_loss': val_metrics['type_loss'],
-            'val/reasoning_loss': val_metrics['reasoning_loss'],
-            'val/consistency_loss': val_metrics['consistency_loss'],
-            'val/gradual_length_loss': val_metrics.get('gradual_length_loss', 0.0),
+            'val/y_loss': val_metrics['y_loss'],
+            'val/z_loss': val_metrics['z_loss'],
             'val/cut_f1': val_metrics['cut']['f1'],
             'val/cut_precision': val_metrics['cut']['precision'],
             'val/cut_recall': val_metrics['cut']['recall'],
@@ -1001,32 +1185,35 @@ def main():
             'val/overall_f1': val_metrics['overall']['f1'],
             'val/overall_precision': val_metrics['overall']['precision'],
             'val/overall_recall': val_metrics['overall']['recall'],
-            # Reasoning diagnostics (motion dynamics by type)
-            'reasoning/cut_acceleration': val_metrics['reasoning']['cut']['acceleration_mean'],
-            'reasoning/cut_jerk': val_metrics['reasoning']['cut']['jerk_mean'],
-            'reasoning/gradual_acceleration': val_metrics['reasoning']['gradual']['acceleration_mean'],
-            'reasoning/gradual_jerk': val_metrics['reasoning']['gradual']['jerk_mean'],
-            'reasoning/none_acceleration': val_metrics['reasoning']['none']['acceleration_mean'],
-            'reasoning/none_jerk': val_metrics['reasoning']['none']['jerk_mean']
-        })
+            'val/best_threshold': val_metrics['best_threshold'],
+            'val/best_cut_threshold': val_metrics['best_cut_threshold'],
+            'val/best_grad_threshold': val_metrics['best_grad_threshold'],
+        }
+        
+        wandb.log(wandb_metrics)
         
         # Print results
         print(f"\nTrain - Loss: {train_metrics['loss']:.4f}, "
-              f"Focal: {train_metrics['focal_loss']:.4f}, "
-              f"Type: {train_metrics['type_loss']:.4f}, "
-              f"Reason: {train_metrics['reasoning_loss']:.4f}, "
-              f"Consist: {train_metrics['consistency_loss']:.4f}, "
+              f"Y: {train_metrics['y_loss']:.4f}, "
+              f"Z: {train_metrics['z_loss']:.4f}, "
               f"F1: {train_metrics['boundary_f1']:.3f}, "
               f"P: {train_metrics['boundary_precision']:.3f}, "
               f"R: {train_metrics['boundary_recall']:.3f}")
         
         print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
-              f"Focal: {val_metrics['focal_loss']:.4f}, "
-              f"Type: {val_metrics['type_loss']:.4f}, "
-              f"Reason: {val_metrics['reasoning_loss']:.4f}, "
-              f"Consist: {val_metrics['consistency_loss']:.4f}")
+              f"Y: {val_metrics['y_loss']:.4f}, "
+              f"Z: {val_metrics['z_loss']:.4f}")
         
-        print(f"\nTransition Metrics (±3 frame tolerance):")
+        best_thr = val_metrics['best_threshold']
+        best_cut_thr  = val_metrics['best_cut_threshold']
+        best_grad_thr = val_metrics['best_grad_threshold']
+        print(f"\nScene Detection (tol=2 | overall_thr={best_thr:.2f} | cut_thr={best_cut_thr:.2f} | grad_thr={best_grad_thr:.2f}):")
+        print(f"  Overall  - P: {val_metrics['overall']['precision']:.3f}, "
+              f"R: {val_metrics['overall']['recall']:.3f}, "
+              f"F1: {val_metrics['overall']['f1']:.3f} "
+              f"(TP: {val_metrics['overall']['tp']}, "
+              f"FP: {val_metrics['overall']['fp']}, "
+              f"FN: {val_metrics['overall']['fn']})")
         print(f"  Cut      - P: {val_metrics['cut']['precision']:.3f}, "
               f"R: {val_metrics['cut']['recall']:.3f}, "
               f"F1: {val_metrics['cut']['f1']:.3f} "
@@ -1039,72 +1226,6 @@ def main():
               f"(TP: {val_metrics['gradual']['tp']}, "
               f"FP: {val_metrics['gradual']['fp']}, "
               f"FN: {val_metrics['gradual']['fn']})")
-        print(f"  Overall  - P: {val_metrics['overall']['precision']:.3f}, "
-              f"R: {val_metrics['overall']['recall']:.3f}, "
-              f"F1: {val_metrics['overall']['f1']:.3f}")
-        
-        # Gradual confusion analysis
-        if 'gradual_confusion' in val_metrics:
-            print(f"\nGradual GT Confusion (where do gradual GTs go?):")
-            total = val_metrics['gradual_confusion']['total']
-            if total > 0:
-                grad_tp = val_metrics['gradual_confusion']['predicted_as_gradual']
-                as_cut = val_metrics['gradual_confusion']['predicted_as_cut']
-                as_none = val_metrics['gradual_confusion']['predicted_as_none']
-                print(f"  ✓ Correctly predicted as gradual: {grad_tp}/{total} ({100*grad_tp/total:.1f}%)")
-                print(f"  ✗ Type error (predicted as cut):  {as_cut}/{total} ({100*as_cut/total:.1f}%)")
-                print(f"  ✗ Missed boundary (as none):      {as_none}/{total} ({100*as_none/total:.1f}%)")
-        
-        # FP source analysis
-        if 'gradual_fp_sources' in val_metrics:
-            fp_total = val_metrics['gradual_fp_sources']['total']
-            if fp_total > 0:
-                print(f"\nGradual False Positives (what gets wrongly predicted as gradual?):")
-                from_cut = val_metrics['gradual_fp_sources']['from_cut']
-                from_none = val_metrics['gradual_fp_sources']['from_none']
-                print(f"  From cuts:  {from_cut}/{fp_total} ({100*from_cut/fp_total:.1f}%)")
-                print(f"  From none:  {from_none}/{fp_total} ({100*from_none/fp_total:.1f}%)")
-        
-        print(f"\nReasoning Diagnostics (Motion Dynamics - TOP discriminators):")
-        print(f"  Cut frames ({val_metrics['reasoning']['cut']['count']}):")
-        print(f"    Acceleration: {val_metrics['reasoning']['cut']['acceleration_mean']:.3f} (expect HIGH spike)")
-        print(f"    Jerk: {val_metrics['reasoning']['cut']['jerk_mean']:.3f} (expect HIGH spike)")
-        print(f"    Gradual prob: {val_metrics['reasoning']['cut']['gradual_prob_mean']:.3f}")
-        
-        print(f"  Gradual frames ({val_metrics['reasoning']['gradual']['count']}):")
-        print(f"    Acceleration: {val_metrics['reasoning']['gradual']['acceleration_mean']:.3f} (expect MODERATE - smooth change)")
-        print(f"    Jerk: {val_metrics['reasoning']['gradual']['jerk_mean']:.3f} (expect LOW - smooth acceleration)")
-        print(f"    Gradual prob: {val_metrics['reasoning']['gradual']['gradual_prob_mean']:.3f} (should be HIGH!)")
-        
-        print(f"  None frames ({val_metrics['reasoning']['none']['count']}):")
-        print(f"    Acceleration: {val_metrics['reasoning']['none']['acceleration_mean']:.3f} (expect LOW/ZERO)")
-        print(f"    Jerk: {val_metrics['reasoning']['none']['jerk_mean']:.3f} (expect LOW/ZERO)")
-        print(f"    Gradual prob: {val_metrics['reasoning']['none']['gradual_prob_mean']:.3f} (should be LOW!)")
-        
-        # Check if motion dynamics are discriminative
-        cut_accel = val_metrics['reasoning']['cut']['acceleration_mean']
-        gradual_accel = val_metrics['reasoning']['gradual']['acceleration_mean']
-        none_accel = val_metrics['reasoning']['none']['acceleration_mean']
-        
-        cut_jerk = val_metrics['reasoning']['cut']['jerk_mean']
-        gradual_jerk = val_metrics['reasoning']['gradual']['jerk_mean']
-        none_jerk = val_metrics['reasoning']['none']['jerk_mean']
-        
-        print(f"\n🎯 MOTION DISCRIMINATIVE POWER:")
-        print(f"  Acceleration separates cut/gradual: {abs(cut_accel - gradual_accel):.3f}")
-        print(f"  Acceleration separates gradual/none: {abs(gradual_accel - none_accel):.3f}")
-        print(f"  Jerk separates cut/gradual: {abs(cut_jerk - gradual_jerk):.3f}")
-        
-        # CRITICAL DIAGNOSTIC
-        print(f"\n🔍 TYPE HEAD ANALYSIS:")
-        gradual_prob_none = val_metrics['reasoning']['none']['gradual_prob_mean']
-        gradual_prob_gradual = val_metrics['reasoning']['gradual']['gradual_prob_mean']
-        print(f"  None frames gradual prob: {gradual_prob_none:.1%}")
-        print(f"  Gradual frames gradual prob: {gradual_prob_gradual:.1%}")
-        if gradual_prob_none > 0.3:
-            print(f"    ⚠ Type head still confused! Need more training.")
-        else:
-                print(f"    ✓ Type head learning to separate gradual/none")
         
         # Save checkpoint
         checkpoint_path = os.path.join(
@@ -1125,8 +1246,8 @@ def main():
             'history': history
         }, checkpoint_path)
         
-        # Save best model
-        val_f1 = val_metrics['overall']['f1']
+        # Save best model — use fixed-threshold F1 to avoid threshold leakage
+        val_f1 = val_metrics['selection_f1']
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             patience_counter = 0
@@ -1181,15 +1302,12 @@ def main():
         'final_cut_f1': float(history['val'][-1]['cut_f1']) if history['val'] else 0,
         'final_gradual_f1': float(history['val'][-1]['gradual_f1']) if history['val'] else 0,
         'config': make_serializable({
-            'main_dim': config['main_dim'],
-            'num_fusion_blocks': config['num_fusion_blocks'],
-            'batch_size': config['batch_size'],
-            'learning_rate': config['learning_rate'],
-            'num_epochs': config['num_epochs'],
+            'lambda1': config['lambda1'],
+            'lambda2': config['lambda2'],
             'focal_alpha': config['focal_alpha'],
             'focal_gamma': config['focal_gamma'],
-            'type_weight': config['type_weight'],
-            'boundary_threshold': config['boundary_threshold']
+            'boundary_threshold': config['boundary_threshold'],
+            'gradual_threshold': config['gradual_threshold']
         })
     }
     

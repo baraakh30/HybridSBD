@@ -1,9 +1,0 @@
-[
-  {
-    "layer": "rgb_spatial_pool",
-    "separation": 0.10415338930683231,
-    "gradual_mean": 0.19311546057462692,
-    "gradual_std": 0.0027051305517987686,
-    "none_mean": 0.19281931775808334,
-    "none_std": 0.0029751042447871854,
-    "discriminative": 

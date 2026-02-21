@@ -1,42 +1,45 @@
 """
-Hybrid Boundary Detector - 2026 SOTA Architecture
+Hybrid Boundary Detector - AutoShot-Style Dual Head Architecture
 
 DESIGN PHILOSOPHY:
-Combines the best of both worlds:
-1. TransNetV2's SECRET: Multi-scale dilated convolutions for LOCAL boundary detection
-2. Modern advancement: Lightweight temporal attention for GLOBAL sequence context
-3. Proven critical: Explicit frame differences as primary signal
-4. Interpretability: Reasoning module that "thinks" step-by-step
-5. Efficiency: ~14M parameters (proven effective range)
+Adopts AutoShot's proven dual-head approach:
+  Head y (one_hot):  Predicts the MIDPOINT frame of each transition (primary)
+  Head z (many_hot): Predicts ALL frames within gradual transitions (auxiliary)
 
-WHY THIS WORKS:
-- Boundaries are LOCAL events → dilated convs with multiple receptive fields
-- Sequence context matters → lightweight attention for long-range dependencies
-- Frame differences strongest signal → explicit RGB diff encoding
-- Multi-scale fusion → combine local (1,2,4,8,16 frames) + global (full sequence)
+Training: L = lambda1 * FocalBCE(y_hat, y) + lambda2 * FocalBCE(z_hat, z)
+  - lambda1 = 5.0 (heavily weighted: precise boundary localization)
+  - lambda2 = 0.1 (lightly weighted: gradual extent awareness)
 
-KEY INNOVATIONS:
-✓ Multi-scale dilated convs (kernels 1,2,4,8,16,32,64) - TransNetV2 insight
-✓ Explicit frame difference encoder - proven critical
-✓ Lightweight temporal attention - efficient global context
-✓ Progressive feature fusion - local to global
-✓ Interpretable reasoning module - step-by-step decision making
-✓ Binary + auxiliary type heads - SOTA formulation
+WHY THIS BEATS THE OLD APPROACH:
+1. one_hot forces SPARSE predictions (1 frame per transition) -> fewer FPs
+2. many_hot teaches gradual awareness WITHOUT over-predicting boundaries
+3. No separate type head -> no gradient contamination between heads
+4. Type inference: high z around a y-peak -> gradual, else -> cut
+5. Clean BCE loss -> no complex class weighting schemes
 
-ARCHITECTURE FLOW:
-Input [B,T,3,H,W]
-  ↓
-Frame Differences [B,T,3,H,W] (explicit RGB diffs)
-  ↓
-Spatial Encoding [B,T,D] (CNN feature extraction)
-  ↓
-Multi-Scale Dilated Convs [B,T,D] (local patterns: 1,2,4,8,16 frames)
-  ↓
-Lightweight Attention [B,T,D] (global sequence context)
-  ↓
-Progressive Fusion [B,T,D] (combine local + global)
-  ↓
-Binary Boundary Head [B,T,1] + Type Head [B,T,2]
+ARCHITECTURE (kept from proven components):
+  Input [B, T, 3, H, W]
+    |
+  PixelMotionExtractor -> [B, T, 15] (motion before CNN)
+  ColorHistogramEncoder -> [B, T, 128] (color palette shifts for graduals)
+  EfficientSpatialEncoder (RGB) -> [B, T, 640] (512 attention + 128 edge)
+  EfficientSpatialEncoder (Diff) -> [B, T, 640] (multi-distance diffs)
+    |
+  Feature fusion (1423 -> main_dim)
+    |
+  ProgressiveFusionBlock x N (dilated convs + attention)
+    |
+  DualBoundaryHead:
+    head_y -> [B, T, 1] one_hot (midpoint of transitions)
+    head_z -> [B, T, 1] many_hot (all gradual frames)
+
+REMOVED (dead weight / counterproductive):
+  - ReasoningModule, MotionDynamicsExtractor (acceleration/jerk not discriminative)
+  - TemporalSimilarity (unused, weak discriminator)
+  - MultiLevelTemporalAggregation (redundant with dilated convs)
+  - TemporalPyramidPooling (redundant temporal pooling)
+  - GradualTransitionDetector (covered by dilated convs at long dilations)
+  - Old BoundaryDetectionHead with type coupling (gradient contamination)
 """
 
 import torch
@@ -45,157 +48,143 @@ import torch.nn.functional as F
 import math
 
 
-class ColorHistogramEncoder(nn.Module):
+class ColorHistogramSimilarity(nn.Module):
     """
-    Explicit color histogram features - TransNetV2's SECRET for gradual transitions
-    
-    WHY THIS MATTERS:
-    - Gradual transitions = slow color palette shifts
-    - CNNs can smooth these out - histograms capture them explicitly
-    - Cheap to compute, massive impact on gradual recall
-    
-    Output: Always 128 dims (TransNetV2 also uses 128 for histograms)
+    AutoShot-style pairwise color histogram similarity features.
+
+    Instead of encoding per-frame histograms as feature vectors, this computes
+    the cosine similarity between frame t's histogram and every frame in a
+    ±50-frame window. This gives an explicit "palette distance" signal:
+      - Cut:     similarity drops to near 0 in a single step
+      - Gradual: smooth decay over many frames
+      - Scene:   similarity stays near 1.0
+
+    This is the key information ColorHistogramEncoder was missing.
+    Output: [B, T, 128]
     """
-    def __init__(self, num_bins=32):
+    def __init__(self, num_bins=64, lookup_window=101, output_dim=128):
         super().__init__()
         self.num_bins = num_bins
-        
-        # Project histogram features to FIXED 128 dims
-        self.hist_proj = nn.Sequential(
-            nn.Linear(num_bins * 3, 128),  # RGB histograms → 128 dims
-            nn.LayerNorm(128),
-            nn.GELU()
+        self.lookup_window = lookup_window
+        assert lookup_window % 2 == 1
+
+        self.fc = nn.Sequential(
+            nn.Linear(lookup_window, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU(inplace=True),
         )
-        
-    def compute_histogram(self, x):
+
+    def _compute_histograms(self, x):
         """
-        Compute RGB histograms for a batch of frames (FULLY VECTORIZED - FASTEST)
-        Args:
-            x: [B, C, H, W] frames in range [0, 1]
-        Returns:
-            [B, num_bins * 3] histogram features
+        x: [B, T, C, H, W]  values in [0, 1]
+        returns: [B, T, num_bins*3] L2-normalised histograms
         """
-        B, C, H, W = x.shape
-        
-        # FASTEST: Use scatter_add for fully vectorized histogram
-        # Quantize to bins: [0,1] -> [0, num_bins-1]
-        x_quantized = (x * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)  # [B, 3, H, W]
-        
-        # Reshape for vectorized processing: [B*3, H*W]
-        x_flat = x_quantized.reshape(B * C, -1)
-        
-        # Create histogram tensor: [B*3, num_bins]
-        hist = torch.zeros(B * C, self.num_bins, device=x.device, dtype=torch.float32)
-        
-        # Vectorized histogram computation using scatter_add
-        ones = torch.ones_like(x_flat, dtype=torch.float32)
-        hist.scatter_add_(1, x_flat, ones)
-        
-        # Normalize and reshape: [B, 3*num_bins]
-        hist = hist / (H * W + 1e-8)
-        hist = hist.reshape(B, C * self.num_bins)
-        
+        B, T, C, H, W = x.shape
+        x_q = (x * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)  # [B,T,C,H,W]
+        x_q = x_q.reshape(B * T * C, H * W)
+
+        hist = torch.zeros(B * T * C, self.num_bins, device=x.device, dtype=torch.float32)
+        ones = torch.ones_like(x_q, dtype=torch.float32)
+        hist.scatter_add_(1, x_q, ones)
+        hist = hist / (H * W + 1e-8)                              # normalise counts
+        hist = hist.reshape(B, T, C * self.num_bins)              # [B, T, bins*3]
+        hist = F.normalize(hist, p=2, dim=2)                      # L2 normalise
         return hist
-    
+
     def forward(self, x):
         """
-        Args:
-            x: [B, C, H, W] frames
-        Returns:
-            [B, 128] histogram features (FIXED dimension)
+        x: [B, T, C, H, W]
+        returns: [B, T, output_dim]
         """
-        hist = self.compute_histogram(x)
-        return self.hist_proj(hist)
+        B, T = x.shape[:2]
+        hist = self._compute_histograms(x)                         # [B, T, D]
+
+        # Pairwise cosine similarity: [B, T, T]
+        sim = torch.bmm(hist, hist.transpose(1, 2))
+
+        # Replicate-pad (same reason as FrameSimilarity): zero-pad makes the first
+        # and last ~50 frames look like scene cuts due to cos-sim dropping to 0.
+        pad = (self.lookup_window - 1) // 2
+        sim_padded = F.pad(sim, (pad, pad), mode='replicate')      # [B, T, T+2*pad]
+
+        t_idx = torch.arange(T, device=x.device)
+        col_idx = (t_idx.unsqueeze(1) +
+                   torch.arange(self.lookup_window, device=x.device).unsqueeze(0))  # [T, W]
+        col_idx = col_idx.unsqueeze(0).expand(B, -1, -1)          # [B, T, W]
+        sim_windowed = torch.gather(sim_padded, 2, col_idx)        # [B, T, W]
+
+        return self.fc(sim_windowed)                               # [B, T, output_dim]
 
 
-class TemporalSimilarity(nn.Module):
+class FrameSimilarity(nn.Module):
     """
-    Modern temporal similarity features for gradual detection
-    
-    KEY INSIGHT from TransNetV2:
-    - Graduals: Similarity smoothly decays (0.95 → 0.90 → 0.85 → 0.80)
-    - Cuts: Similarity drops sharply (0.95 → 0.30)
-    - None: Similarity stays constant (0.98 → 0.98)
-    
-    IMPROVEMENTS over TransNetV2:
-    - Multi-scale similarities (not just one lookup window)
-    - Efficient offset-based computation (not full T×T matrix)
-    - Learnable similarity aggregation
-    - Works with spatial features (flexible input dimension)
-    
-    Output: Always 128 dims (TransNetV2 also uses 128 for similarity)
+    AutoShot-style CNN-level frame similarity features.
+
+    Projects CNN features to a normalised embedding space and computes
+    the cosine similarity between frame t and every frame in a ±50-frame
+    window.  The pattern is unambiguous:
+      - Cut:     similarity to future frames collapses to ~0 at the cut frame
+      - Gradual: smooth V-shaped dip over tens of frames
+      - Scene:   similarity stays high
+
+    This is the component AutoShot identifies as the dominant discriminator
+    between cuts and graduals that a plain CNN cannot capture.
+    Output: [B, T, output_dim]
     """
-    def __init__(self, input_dim, similarity_offsets=[1, 2, 4, 8, 16, 32]):
+    def __init__(self, in_channels, lookup_window=101, output_dim=128):
         super().__init__()
-        
-        self.similarity_offsets = similarity_offsets
-        
-        # Project input features for similarity computation
-        # Handles both global (256) and spatial (3072) features
-        self.proj = nn.Sequential(
-            nn.Linear(input_dim, 256),  # Project to fixed 256 for similarity
-            nn.LayerNorm(256),
-            nn.GELU()
+        self.lookup_window = lookup_window
+        assert lookup_window % 2 == 1
+
+        # No learnable projection — just L2-normalise the input features directly.
+        # A trainable Linear here would overfit: it learns to map training-set frames
+        # into a space that looks like training labels, then fails on val.
+        # Raw L2-normalised deep features already have strong inter-scene distance.
+        self.fc = nn.Sequential(
+            nn.Linear(lookup_window, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU(inplace=True),
         )
-        
-        # Learnable aggregation of similarities → FIXED 128 dims
-        self.similarity_fusion = nn.Sequential(
-            nn.Linear(len(similarity_offsets), 128),
-            nn.LayerNorm(128),
-            nn.GELU()
-        )
-        
+
     def forward(self, x):
         """
-        Args:
-            x: [B, T, 256] temporal features from spatial encoder
-        Returns:
-            [B, T, 128] similarity features (FIXED dimension)
+        x: [B, T, in_channels]  CNN features (spatially pooled)
+        returns: [B, T, output_dim]
         """
         B, T, C = x.shape
-        
-        # Project for similarity computation
-        x_proj = self.proj(x)  # [B, T, C]
-        x_norm = F.normalize(x_proj, p=2, dim=-1)  # L2 normalize
-        
-        # Compute cosine similarities at multiple offsets
-        similarities = []
-        for offset in self.similarity_offsets:
-            if offset < T:
-                # Cosine similarity between frame t and frame t+offset
-                sim = (x_norm[:, :-offset] * x_norm[:, offset:]).sum(dim=-1)  # [B, T-offset]
-                # Pad to full length
-                sim_padded = F.pad(sim, (0, offset), value=1.0)  # Pad with 1.0 (self-similarity)
-                similarities.append(sim_padded.unsqueeze(-1))  # [B, T, 1]
-            else:
-                # Offset too large, use self-similarity
-                similarities.append(torch.ones(B, T, 1, device=x.device))
-        
-        # Stack similarities: [B, T, num_offsets]
-        similarities = torch.cat(similarities, dim=-1)
-        
-        # Learnable aggregation
-        similarity_features = self.similarity_fusion(similarities)  # [B, T, C//2]
-        
-        return similarity_features
+
+        # L2-normalise only — no learned projection
+        proj = F.normalize(x.reshape(B * T, C), p=2, dim=1)      # [B*T, C]
+        proj = proj.reshape(B, T, C)                               # [B, T, C]
+
+        # Pairwise cosine similarity: [B, T, T]
+        sim = torch.bmm(proj, proj.transpose(1, 2))
+
+        # Replicate-pad: boundary frames copy their nearest real neighbour.
+        # Zero-pad creates a fake "similarity drop" at every clip edge because
+        # cos-sim(real_frame, zero_vector) -> 0, which is indistinguishable from
+        # a true scene cut -> systematic FP at every clip boundary during inference.
+        pad = (self.lookup_window - 1) // 2
+        sim_padded = F.pad(sim, (pad, pad), mode='replicate')      # [B, T, T+2*pad]
+
+        t_idx = torch.arange(T, device=x.device)
+        col_idx = (t_idx.unsqueeze(1) +
+                   torch.arange(self.lookup_window, device=x.device).unsqueeze(0))  # [T, W]
+        col_idx = col_idx.unsqueeze(0).expand(B, -1, -1)          # [B, T, W]
+        sim_windowed = torch.gather(sim_padded, 2, col_idx)        # [B, T, W]
+
+        return self.fc(sim_windowed)                               # [B, T, output_dim]
 
 
 class EdgeDensityExtractor(nn.Module):
     """
-    Extract edge density features - TOP discriminator (3.172 separation)
+    Extract edge density features - TOP discriminator (3.172 separation score).
     
-    Empirical finding: Graduals have HIGH edge variance (content emergence)
-    vs smooth pans have LOW edge variance (just translation)
-    
-    Computes:
-    - Edge density per region
-    - Variance of edge density across regions (KEY!)
-    - Edge orientation distribution
+    Graduals have HIGH edge variance (content emergence)
+    vs smooth pans have LOW edge variance (just translation).
     """
     def __init__(self, in_channels=256):
         super().__init__()
-        
-        # Sobel-style edge detector
         self.edge_conv = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, groups=1)
         
     def forward(self, x):
@@ -203,255 +192,198 @@ class EdgeDensityExtractor(nn.Module):
         Args:
             x: [B, 256, 6, 8] spatial CNN features
         Returns:
-            [B, 64] edge density features (reduced from 128)
+            [B, 64] edge density features
         """
         B, C, H, W = x.shape
-        
-        # Compute edge magnitude per spatial location
-        edges = torch.abs(self.edge_conv(x))  # [B, 32, 6, 8]
-        
-        # 1. Edge density variance across regions (KEY DISCRIMINATOR!)
-        # Gradual: edges in some regions, not others (content emergence)
-        # Pan: edges uniformly distributed (just translation)
-        edge_per_region = edges.reshape(B, 32, -1)  # [B, 32, 48]
-        edge_variance = edge_per_region.var(dim=2)  # [B, 32] - HIGH = gradual
-        
-        # 2. Overall edge density (magnitude)
-        edge_mean = edge_per_region.mean(dim=2)  # [B, 32]
-        
-        # Combine: variance (primary) + mean (secondary)
-        stats = torch.cat([edge_variance, edge_mean], dim=1)  # [B, 64]
-        
+        edges = torch.abs(self.edge_conv(x))
+        edge_per_region = edges.reshape(B, 32, -1)
+        edge_variance = edge_per_region.var(dim=2)
+        edge_mean = edge_per_region.mean(dim=2)
+        stats = torch.cat([edge_variance, edge_mean], dim=1)
         return stats
-
-
-class SpatialAttentionPooling(nn.Module):
-    """
-    Multi-scale attention-based spatial pooling
-    
-    Uses attention at multiple scales to capture both:
-    - Fine-grained: Local edge patterns, small regions
-    - Coarse-grained: Global structure, large regions
-    
-    This preserves discriminative information without parameter explosion.
-    
-    Input: [B, C, H, W] spatial features
-    Output: [B, out_dim] multi-scale attention-weighted features
-    """
-    def __init__(self, in_channels=256, out_dim=512, num_heads=8):
-        super().__init__()
-        
-        self.num_heads = num_heads
-        self.head_dim = out_dim // num_heads
-        
-        # Fine-grained attention (full 6×8 resolution)
-        self.fine_query = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(1),
-            nn.Linear(in_channels, out_dim // 2)
-        )
-        self.fine_key = nn.Conv2d(in_channels, out_dim // 2, kernel_size=1)
-        self.fine_value = nn.Conv2d(in_channels, out_dim // 2, kernel_size=1)
-        
-        # Coarse-grained attention (2×2 regions)
-        self.coarse_query = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(1),
-            nn.Linear(in_channels, out_dim // 2)
-        )
-        self.coarse_key = nn.Conv2d(in_channels, out_dim // 2, kernel_size=1)
-        self.coarse_value = nn.Conv2d(in_channels, out_dim // 2, kernel_size=1)
-        
-        # Fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(out_dim, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.GELU()
-        )
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, 256, 6, 8] spatial features
-        Returns:
-            [B, out_dim] multi-scale attention-pooled features
-        """
-        B, C, H, W = x.shape
-        
-        # FINE-GRAINED: Attend to all 48 locations
-        fine_q = self.fine_query(x)  # [B, out_dim//2]
-        fine_k = self.fine_key(x).flatten(2)  # [B, out_dim//2, 48]
-        fine_v = self.fine_value(x).flatten(2)  # [B, out_dim//2, 48]
-        
-        # Attention over spatial locations
-        fine_attn = torch.einsum('bd,bdn->bn', fine_q, fine_k)  # [B, 48]
-        fine_attn = torch.softmax(fine_attn / (self.head_dim ** 0.5), dim=-1)
-        fine_out = torch.einsum('bn,bdn->bd', fine_attn, fine_v)  # [B, out_dim//2]
-        
-        # COARSE-GRAINED: Pool to 2×2 then attend
-        x_coarse = F.adaptive_avg_pool2d(x, (2, 2))  # [B, 256, 2, 2]
-        coarse_q = self.coarse_query(x_coarse)  # [B, out_dim//2]
-        coarse_k = self.coarse_key(x_coarse).flatten(2)  # [B, out_dim//2, 4]
-        coarse_v = self.coarse_value(x_coarse).flatten(2)  # [B, out_dim//2, 4]
-        
-        coarse_attn = torch.einsum('bd,bdn->bn', coarse_q, coarse_k)
-        coarse_attn = torch.softmax(coarse_attn / (self.head_dim ** 0.5), dim=-1)
-        coarse_out = torch.einsum('bn,bdn->bd', coarse_attn, coarse_v)  # [B, out_dim//2]
-        
-        # Combine fine and coarse
-        out = torch.cat([fine_out, coarse_out], dim=-1)  # [B, out_dim]
-        out = self.fusion(out)
-        
-        return out
 
 
 class EfficientSpatialEncoder(nn.Module):
     """
-    Spatial-aware CNN encoder with statistics extraction + attention pooling
-    
-    TWO-STAGE APPROACH:
-    1. Extract spatial statistics BEFORE pooling (preserves discriminative patterns)
-    2. Attention pooling for global summary (efficient representation)
-    
-    This captures both spatial variance AND content-weighted summary!
-    
-    Architecture: 16→64→128→256 channels
-    Output: [B, 640] = 512 (attention) + 128 (spatial stats)
+    CNN encoder with stacked dilated 3D stem + shared 2D body.
+
+    Two forward paths share the same conv2/3/4 body, GAP, and edge extractor:
+
+      forward()           — temporal path (3D stem → body)
+        stem3d sees ±7 frames at pixel level → detects dissolve blending/motion blur.
+        Used for: rgb_features (temporal context), diff_features.
+
+      forward_per_frame() — 2D-only path (entry2d → body)
+        NO temporal mixing: each frame processed independently.
+        Used for: FrameSimilarity, feat_delta (need sharp cut signatures).
+        Reuses the identical body weights — zero extra computation.
+
+    Input:  [B, T, C, H, W]
+    Output: [B, T, output_dim + 128]  (both paths)
     """
     def __init__(self, input_channels=3, output_dim=512):
         super().__init__()
-        
-        # CNN backbone (same as before)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # H/2, W/2
+
+        # --- Temporal path: pseudo-3D stacked-channel Conv2d stem ---
+        # Strategy: spatial downsample FIRST (cheap, 4x fewer activations), then
+        # stack [x[t-d], x[t], x[t+d]] as 3C channels, use 1x1 Conv2d for temporal
+        # mixing (no spatial processing needed — body handles that). This is ~36x
+        # fewer FLOPs than the naive (3C, 3x3) @ full resolution approach.
+        # RF over time: 1 + 2*1 + 2*2 + 2*4 = 15 frames (±7 temporal receptive field).
+        # DO NOT use for FrameSimilarity/feat_delta — temporal blending blurs cut spikes.
+        self.stem_spatial = nn.Sequential(
+            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # H/2, W/2 — do spatial reduction BEFORE temporal stack
         )
-        
+        self.stem_t1 = nn.Sequential(
+            nn.Conv2d(16 * 3, 16, kernel_size=1, bias=False),  # 1x1: pure temporal mixing
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+        )
+        self.stem_t2 = nn.Sequential(
+            nn.Conv2d(16 * 3, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+        )
+        self.stem_t4 = nn.Sequential(
+            nn.Conv2d(16 * 3, 16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # additional H/4, W/4 — matches body input stride
+        )
+
+        # --- Shared 2D body (used by BOTH paths) ---
+        # Running conv2/3/4 once via the temporal path gives rgb_features.
+        # forward_per_frame() reuses these same weights — no duplicate computation.
         self.conv2 = nn.Sequential(
             nn.Conv2d(16, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # H/4, W/4
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
         )
-        
         self.conv3 = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2)  # H/8, W/8
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)
         )
-        
         self.conv4 = nn.Sequential(
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-            # NO pooling here - keep spatial structure
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True)
         )
-        
-        # STAGE 1: Extract edge density features (TOP discriminator)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.gap_proj = nn.Sequential(
+            nn.Flatten(1),
+            nn.Linear(256, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
         self.edge_extractor = EdgeDensityExtractor(in_channels=256)
         self.edge_proj = nn.Sequential(
-            nn.Linear(64, 128),  # Edge features → 128 dims
-            nn.LayerNorm(128),
-            nn.GELU()
+            nn.Linear(64, 128), nn.LayerNorm(128), nn.GELU()
         )
-        
-        # STAGE 2: Attention pooling (content-weighted summary)
-        self.spatial_pool = SpatialAttentionPooling(
-            in_channels=256,
-            out_dim=output_dim,
-            num_heads=8
-        )
-        
+
+    def forward_per_frame(self, x):
+        """
+        2D-only path: NO temporal mixing. Each frame is processed independently.
+        Reuses the same conv2/3/4 / gap / edge body weights — zero extra parameters.
+
+        NOTE: This DOES run the body a second time (separate from forward()).
+        That is intentional: forward() produces 3D-blended features (best for gradual
+        detection), forward_per_frame() produces sharp features (required for
+        FrameSimilarity and feat_delta, where temporal blending destroys the signal).
+        The compute overhead is ~50% of the rgb_encoder cost.
+
+        Input:  [B, T, C, H, W]
+        Output: [B, T, output_dim + 128]  (same 640 dims as forward())
+        """
+        B, T, C, H, W = x.shape
+        x_bt = x.reshape(B * T, C, H, W)
+        x2d = self.stem_spatial(x_bt)    # [B*T, 16, H/2, W/2]
+        x2d = F.max_pool2d(x2d, 2)      # [B*T, 16, H/4, W/4] — matches stem_t4's MaxPool2d
+        return self._body(x2d).reshape(B, T, -1)
+
+    def _temporal_stack(self, x_bt, T, dilation):
+        """Stack [x[t-d], x[t], x[t+d]] as channels. Boundary frames get zeros."""
+        B_T, C, H, W = x_bt.shape
+        x = x_bt.reshape(-1, T, C, H, W)        # [B, T, C, H, W]
+        B = x.shape[0]
+        d = dilation
+        # Zero-pad boundaries — reflect padding creates false gradual signals at clip edges
+        prev = torch.cat([torch.zeros_like(x[:, :d]), x[:, :-d]], dim=1) if d < T else torch.zeros_like(x)
+        next_ = torch.cat([x[:, d:], torch.zeros_like(x[:, -d:])], dim=1) if d < T else torch.zeros_like(x)
+        stacked = torch.cat([prev, x, next_], dim=2)   # [B, T, 3C, H, W]
+        return stacked.reshape(B * T, -1, H, W)         # [B*T, 3C, H, W]
+
+    def _body(self, x2d):
+        """Shared 2D body: [B*T, 16, H/4, W/4] → [B*T, output_dim+128]"""
+        x2d = self.conv2(x2d)
+        x2d = self.conv3(x2d)
+        x2d = self.conv4(x2d)
+        pooled = self.gap_proj(self.gap(x2d))
+        edge   = self.edge_proj(self.edge_extractor(x2d))
+        return torch.cat([pooled, edge], dim=-1)
+
     def forward(self, x):
         """
-        Args:
-            x: [B, C, H, W] - single frame or batch of frames
-        Returns:
-            [B, 640] - 512 (attention) + 128 (edge features)
+        Temporal path (pseudo-3D stem → shared body). Use for rgb_features, diff_features.
+        Input:  [B, T, C, H, W]
+        Output: [B, T, output_dim + 128]  = [B, T, 640]
         """
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)  # [B, 256, 6, 8] - spatial structure preserved
-        
-        # Extract edge density features BEFORE pooling!
-        edge_features = self.edge_extractor(x)  # [B, 64]
-        edge_features = self.edge_proj(edge_features)  # [B, 128]
-        
-        # Attention pooling for global summary
-        pooled = self.spatial_pool(x)  # [B, 512]
-        
-        # Combine both: global summary + edge features
-        out = torch.cat([pooled, edge_features], dim=-1)  # [B, 640]
-        
-        return out
+        B, T, C, H, W = x.shape
+        x_bt = x.reshape(B * T, C, H, W)
+
+        # Spatial reduction first (cheap), then pseudo-3D temporal mixing at H/2 resolution
+        s0 = self.stem_spatial(x_bt)                                   # [B*T, 16, H/2, W/2]
+        s1 = self.stem_t1(self._temporal_stack(s0,  T, dilation=1))   # [B*T, 16, H/2, W/2]
+        s2 = self.stem_t2(self._temporal_stack(s1,  T, dilation=2))   # [B*T, 16, H/2, W/2]
+        x2d = self.stem_t4(self._temporal_stack(s2, T, dilation=4))   # [B*T, 16, H/4, W/4]
+        return self._body(x2d).reshape(B, T, -1)
+
 
 
 class MultiScaleDilatedConv(nn.Module):
     """
-    Multi-scale dilated temporal convolutions - TransNetV2's SECRET WEAPON
+    Multi-scale dilated temporal convolutions - TransNetV2's core mechanism.
     
-    WHY DILATED CONVOLUTIONS:
-    - Capture patterns at multiple temporal scales WITHOUT pooling
-    - Kernel 1: Single frame changes (instant cuts)
-    - Kernel 2: 2-frame patterns (quick cuts)
-    - Kernel 4: 4-frame patterns (fade transitions start)
-    - Kernel 8: 8-frame patterns (dissolve/wipe mid-transition)
-    - Kernel 16: 16-frame patterns (medium gradual transitions)
-    - Kernel 32: 32-frame patterns (long gradual transitions)
-    - Kernel 64: 64-frame patterns (very long gradual transitions - up to 128 frames!)
+    Captures patterns at multiple temporal scales WITHOUT pooling:
+    - Dilation 1:  Instant cuts (1 frame)
+    - Dilation 4:  Quick fades (4-7 frames)  
+    - Dilation 16: Medium graduals (16-31 frames)
+    - Dilation 64: Long graduals (64-127 frames)
     
-    EXTENDED for ClipShots dataset (graduals up to 81 frames):
-    - Added dilation 32 and 64 to cover full gradual range
-    - This fixes the "very long gradual" detection problem
-    
-    TransNetV2 proved this works better than:
-    - Regular convolutions (limited receptive field)
-    - Pooling (loses temporal precision)
-    - Transformers (overkill for local patterns)
+    4 scales cover the full 1-127 frame range with exponential growth.
     """
-    def __init__(self, dim, dilation_rates=[1, 2, 4, 8, 16, 32, 64]):
+    def __init__(self, dim, dilation_rates=[1, 4, 16, 64]):
         super().__init__()
         
         self.dilation_rates = dilation_rates
         
-        # Separate dilated conv for each scale
         self.dilated_convs = nn.ModuleList([
             nn.Conv1d(
-                dim, dim, 
+                dim, dim,
                 kernel_size=3,
                 dilation=rate,
-                padding=rate,  # Same padding for each dilation
-                groups=dim // 4  # Depthwise groups for efficiency
+                padding=rate,
+                groups=dim // 4
             )
             for rate in dilation_rates
         ])
         
-        # Batch norm and activation for each scale
         self.norms = nn.ModuleList([
             nn.BatchNorm1d(dim) for _ in dilation_rates
         ])
         
-        # Fusion layer - combine multi-scale features
         self.fusion = nn.Sequential(
             nn.Conv1d(dim * len(dilation_rates), dim, kernel_size=1),
             nn.BatchNorm1d(dim),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),  # 3.15M params with no regularization was primary overfit source
         )
         
     def forward(self, x):
@@ -461,113 +393,28 @@ class MultiScaleDilatedConv(nn.Module):
         Returns:
             [B, T, C] multi-scale temporal features
         """
-        # Transpose for 1D conv: [B, C, T]
         x_t = x.transpose(1, 2)
         
-        # Apply each dilated conv at its scale
         scale_features = []
         for conv, norm in zip(self.dilated_convs, self.norms):
-            feat = conv(x_t)  # [B, C, T]
+            feat = conv(x_t)
             feat = norm(feat)
             feat = F.relu(feat, inplace=True)
             scale_features.append(feat)
         
-        # Concatenate all scales
-        multi_scale = torch.cat(scale_features, dim=1)  # [B, C*num_scales, T]
-        
-        # Fuse scales
-        fused = self.fusion(multi_scale)  # [B, C, T]
-        
-        # Residual connection
+        multi_scale = torch.cat(scale_features, dim=1)
+        fused = self.fusion(multi_scale)
         output = fused + x_t
         
-        # Transpose back: [B, T, C]
         return output.transpose(1, 2)
-
-
-class MultiLevelTemporalAggregation(nn.Module):
-    """
-    LIGHTWEIGHT Multi-level temporal aggregation for long-range patterns
-    
-    FIX 2: Addresses issue that graduals can be 81+ frames long
-    OPTIMIZED: Reduced parameters by using shared projections and fewer levels
-    
-    Hierarchy:
-    - Level 1: Global pooling (sees all 128 frames)
-    - Level 2: Long-range [64, 96] - covers 81-frame graduals (reduced from 3 to 2)
-    - Level 3: Medium-range [16] - medium graduals (reduced from 2 to 1)
-    
-    This ensures we can see ENTIRE gradual transitions with fewer params!
-    """
-    def __init__(self, dim):
-        super().__init__()
-        
-        # Level 1: Global sequence context (lightweight)
-        self.global_pool = nn.AdaptiveAvgPool1d(16)  # No conv, just pooling
-        
-        # Shared projection for all dilated convs (parameter sharing!)
-        # Instead of separate convs, project once then apply dilations
-        self.shared_proj = nn.Conv1d(dim, dim // 4, kernel_size=1)
-        
-        # Level 2: Long-range (for long graduals: 81 frames) - REDUCED to 2
-        self.long_range = nn.ModuleList([
-            nn.Conv1d(dim // 4, dim // 8, kernel_size=3, dilation=d, padding=d)
-            for d in [64, 96]  # Only keep longest 2
-        ])
-        
-        # Level 3: Medium-range - REDUCED to 1
-        self.mid_range = nn.Conv1d(dim // 4, dim // 8, kernel_size=3, dilation=16, padding=16)
-        
-        # Fusion: Combine 4 sources (global + 2 long + 1 mid)
-        # dim (global) + dim//8 * 2 (long) + dim//8 (mid) = dim + 3*dim//8
-        total_channels = dim + 3 * (dim // 8)
-        self.fusion = nn.Conv1d(total_channels, dim, 1)
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, C] temporal features
-        Returns:
-            [B, T, C] multi-level aggregated features
-        """
-        B, T, C = x.shape
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        
-        # Level 1: Global (just pooling + interpolation, no extra params!)
-        global_feat = self.global_pool(x_t)  # [B, C, 16]
-        global_feat = F.interpolate(global_feat, size=T, mode='linear', align_corners=False)  # [B, C, T]
-        
-        # Shared projection (parameter sharing for efficiency)
-        x_proj = self.shared_proj(x_t)  # [B, C//4, T]
-        
-        # Level 2: Long-range (2 dilations only)
-        long_feats = [conv(x_proj) for conv in self.long_range]  # 2 × [B, C//8, T]
-        
-        # Level 3: Medium-range (1 dilation only)
-        mid_feat = self.mid_range(x_proj)  # [B, C//8, T]
-        
-        # Concatenate: global + 2 long + 1 mid
-        all_feats = [global_feat] + long_feats + [mid_feat]
-        combined = torch.cat(all_feats, dim=1)  # [B, total_channels, T]
-        
-        # Fuse and add residual
-        fused = self.fusion(combined)  # [B, C, T]
-        output = fused + x_t  # Residual
-        
-        return output.transpose(1, 2)  # [B, T, C]
 
 
 class LightweightTemporalAttention(nn.Module):
     """
-    Efficient temporal self-attention for global sequence context
+    Efficient temporal self-attention for global sequence context.
     
-    DESIGN CHOICES:
-    - Single-head attention (boundary detection doesn't need multiple heads)
-    - Linear complexity via efficient attention patterns
-    - Small key/value dims (global context, not fine-grained)
-    - Residual connection (attention as refinement, not primary path)
-    
-    This gives global context WITHOUT the bloat of full transformers
+    Pre-norm transformer style with residual connection.
+    Attention as refinement, not primary path.
     """
     def __init__(self, dim, num_heads=4):
         super().__init__()
@@ -576,16 +423,11 @@ class LightweightTemporalAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Linear projections
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim)
-        
-        # Layer norm (pre-norm transformer style)
         self.norm = nn.LayerNorm(dim)
-        
-        # Dropout
-        self.attn_drop = nn.Dropout(0.1)
-        self.proj_drop = nn.Dropout(0.1)
+        self.attn_drop = nn.Dropout(0.15)
+        self.proj_drop = nn.Dropout(0.15)
         
     def forward(self, x):
         """
@@ -596,215 +438,31 @@ class LightweightTemporalAttention(nn.Module):
         """
         B, T, C = x.shape
         
-        # Pre-norm
         x_norm = self.norm(x)
-        
-        # QKV projections
         qkv = self.qkv(x_norm).reshape(B, T, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, T, head_dim]
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Scaled dot-product attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, T, T]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
-        # Apply attention to values
         out = (attn @ v).transpose(1, 2).reshape(B, T, C)
         out = self.proj(out)
         out = self.proj_drop(out)
         
-        # Residual connection
         return x + out
-
-
-class TemporalPyramidPooling(nn.Module):
-    """
-    Simplified temporal pyramid pooling
-    
-    Uses adaptive pooling at multiple scales to capture patterns at different temporal resolutions
-    Reduced from [1,2,4,8] to [1,4,8] - removes redundant level
-    """
-    def __init__(self, dim, pyramid_levels=[1, 4, 8]):
-        super().__init__()
-        self.pyramid_levels = pyramid_levels
-        self.num_levels = len(pyramid_levels)  # 3 levels
-        
-        # Project concatenated pyramid features back to dim
-        # Each level contributes C channels, so total is num_levels * C
-        self.pyramid_proj = nn.Sequential(
-            nn.Linear(dim * self.num_levels, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, C] temporal features
-        Returns:
-            [B, T, C] pyramid-pooled features
-        """
-        B, T, C = x.shape
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        
-        pyramid_features = []
-        for bins in self.pyramid_levels:
-            # AdaptiveAvgPool1d outputs exactly 'bins' values regardless of T
-            pooled = F.adaptive_avg_pool1d(x_t, bins)  # [B, C, bins]
-            # Upsample back to T using interpolation
-            upsampled = F.interpolate(pooled, size=T, mode='linear', align_corners=False)  # [B, C, T]
-            pyramid_features.append(upsampled)
-        
-        # Concatenate all pyramid levels: [B, C*3, T] (3 levels)
-        pyramid = torch.cat(pyramid_features, dim=1)
-        pyramid = pyramid.transpose(1, 2)  # [B, T, C*3]
-        
-        # Project back to original dimension
-        output = self.pyramid_proj(pyramid)  # [B, T, C]
-        
-        return output
-
-
-# LengthPredictor removed - was not providing clear benefit and added complexity
-
-
-class GradualTransitionDetector(nn.Module):
-    """
-    LIGHTWEIGHT Specialized detector for gradual transitions (FIX 5)
-    
-    Key insight: Graduals have SLOW MONOTONIC CHANGE over LONG windows (20-81 frames)
-    OPTIMIZED: Reduced from 4 trend detectors to 2, simplified smoothness
-    
-    Features:
-    1. Long-window trend detection (2 key sizes instead of 4)
-    2. Smoothness gating (low variance = gradual)
-    """
-    def __init__(self, dim):
-        super().__init__()
-        
-        # REDUCED: Only 2 critical window sizes (was 4)
-        self.trend_detectors = nn.ModuleList([
-            nn.Conv1d(dim, 16, kernel_size=k, padding=k//2, dilation=1)  # 16 channels (was 32)
-            for k in [41, 81]  # Only keep medium and long (drop 21, 61)
-        ])
-        
-        # REDUCED: Only 1 smoothness window (was 3)
-        self.smoothness_window = 41
-        
-        # Simpler fusion (no intermediate layer)
-        # Input: 2*16 (trends) + 1 (smoothness) = 33
-        self.fusion = nn.Sequential(
-            nn.Linear(33, 32),
-            nn.LayerNorm(32),
-            nn.GELU()
-        )
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, C] temporal features
-        Returns:
-            gradual_features: [B, T, 32] gradual-specific features
-        """
-        B, T, C = x.shape
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        
-        # 1. Long-window trend detection (REDUCED: 2 windows)
-        trends = [detector(x_t) for detector in self.trend_detectors]  # 2 × [B, 16, T]
-        trends = torch.cat(trends, dim=1).transpose(1, 2)  # [B, T, 32]
-        
-        # 2. Smoothness feature (SIMPLIFIED: 1 window)
-        # Use simple pooling instead of unfold for efficiency
-        pooled = F.avg_pool1d(x_t, kernel_size=self.smoothness_window, stride=1, padding=self.smoothness_window//2)
-        smoothness = (x_t - pooled).pow(2).mean(dim=1, keepdim=True).transpose(1, 2)  # [B, T, 1]
-        
-        # 3. Combine
-        combined = torch.cat([trends, smoothness], dim=-1)  # [B, T, 33]
-        gradual_features = self.fusion(combined)  # [B, T, 32]
-        
-        return gradual_features
-
-
-class ProgressiveFusionBlock(nn.Module):
-    """
-    Progressive fusion with multi-level temporal aggregation
-    
-    REDESIGNED STRATEGY:
-    1. Multi-level temporal patterns (FIX 2) - see long graduals
-    2. Local patterns (dilated convs) - primary signal
-    3. Global context (attention) - refinement
-    4. Gated fusion - learn what to keep from each
-    """
-    def __init__(self, dim):
-        super().__init__()
-        
-        # Multi-level temporal aggregation (FIX 2)
-        self.multi_level = MultiLevelTemporalAggregation(dim)
-        
-        # Multi-scale dilated convolutions (local patterns)
-        self.local_conv = MultiScaleDilatedConv(dim)
-        
-        # Lightweight temporal attention (global context)
-        self.global_attn = LightweightTemporalAttention(dim)
-        
-        # Gated fusion - learn to combine all three
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 3, dim),
-            nn.Sigmoid()
-        )
-        
-        self.fusion = nn.Sequential(
-            nn.Linear(dim * 3, dim),
-            nn.LayerNorm(dim),
-            nn.GELU()
-        )
-        
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, C] temporal features
-        Returns:
-            [B, T, C] fused multi-level + local + global features
-        """
-        # Extract multi-level patterns (long + medium + short range)
-        multi_level_feat = self.multi_level(x)
-        
-        # Extract local patterns (dilated convs)
-        local_feat = self.local_conv(x)
-        
-        # Extract global context (attention)
-        global_feat = self.global_attn(x)
-        
-        # Concatenate for gating
-        combined = torch.cat([multi_level_feat, local_feat, global_feat], dim=-1)
-        
-        # Compute gate weights
-        gate_weight = self.gate(combined)
-        
-        # Gated fusion
-        fused = self.fusion(combined)
-        # Blend all three with learned weights
-        fused = gate_weight * (multi_level_feat + local_feat + global_feat) / 3 + fused
-        
-        return fused
 
 
 class PixelMotionExtractor(nn.Module):
     """
-    Extract motion features from RAW PIXELS before CNN encoding
+    Extract motion features from RAW PIXELS before CNN encoding.
     
-    CRITICAL FIX: Motion computed BEFORE spatial pooling destroys coherence!
+    Features at 5 temporal distances [1, 2, 4, 8, 16]:
+    - Magnitude statistics (mean, std)
+    - Direction coherence (uniform = pan, non-uniform = content change)
     
-    Features extracted:
-    1. Magnitude statistics (mean, std) - overall motion strength
-    2. Direction coherence - are pixels moving same direction? (pan vs content change)
-    3. Spatial variance - is motion uniform (pan) or localized (content emergence)?
-    
-    Key discriminators:
-    - Smooth pan: HIGH coherence, LOW variance, UNIFORM magnitude
-    - Gradual: LOW coherence, HIGH variance, NON-UNIFORM magnitude
+    Output: [B, T, 15] (5 distances x 3 stats)
     """
     def __init__(self):
         super().__init__()
@@ -814,368 +472,300 @@ class PixelMotionExtractor(nn.Module):
         Args:
             x: [B, T, C, H, W] raw video frames
         Returns:
-            motion_features: [B, T, D] where D = 15 (5 distances × 3 stats)
+            motion_features: [B, T, 15]
         """
         B, T, C, H, W = x.shape
-        
-        # Compute statistics for multiple temporal distances
+
         distances = [1, 2, 4, 8, 16]
         all_stats = []
-        
+
         for dist in distances:
             if dist < T:
-                # Frame differences at this distance
-                diff = x[:, dist:] - x[:, :-dist]  # [B, T-dist, 3, H, W]
-                
-                # Convert to grayscale to focus on motion, not color
-                # Y = 0.299*R + 0.587*G + 0.114*B
-                diff_gray = 0.299 * diff[:, :, 0] + 0.587 * diff[:, :, 1] + 0.114 * diff[:, :, 2]  # [B, T-dist, H, W]
-                
-                # 1. Magnitude statistics
+                # Backward difference: diff[t] = x[t] - x[t-dist]
+                # Fires AT the cut frame (high magnitude exactly at frame t=cut),
+                # not dist frames before it.
+                diff = x[:, dist:] - x[:, :-dist]   # [B, T-dist, C, H, W]
+                diff_gray = (0.299 * diff[:, :, 0]
+                           + 0.587 * diff[:, :, 1]
+                           + 0.114 * diff[:, :, 2])  # [B, T-dist, H, W]
+
                 magnitude = diff_gray.abs()
-                mag_mean = magnitude.mean(dim=[2, 3])  # [B, T-dist]
-                mag_std = magnitude.std(dim=[2, 3])    # [B, T-dist]
-                
-                # 2. Direction coherence (spatial consistency of motion)
-                # Compute gradients to get motion direction
-                # Use simple finite differences
-                grad_y = diff_gray[:, :, 1:, :] - diff_gray[:, :, :-1, :]  # [B, T-dist, H-1, W]
-                grad_x = diff_gray[:, :, :, 1:] - diff_gray[:, :, :, :-1]  # [B, T-dist, H, W-1]
-                
-                # Coherence: How uniform is the gradient field?
-                # High coherence = all gradients point same way (pan)
-                # Low coherence = gradients point different ways (content change)
-                coherence_y = (grad_y.sign().abs().mean(dim=[2, 3]))  # Proportion of consistent signs
-                coherence_x = (grad_x.sign().abs().mean(dim=[2, 3]))
-                coherence = (coherence_y + coherence_x) / 2  # [B, T-dist]
-                
-                # Combine stats for this distance
-                stats = torch.stack([mag_mean, mag_std, coherence], dim=-1)  # [B, T-dist, 3]
-                
-                # Pad to full sequence length
-                stats = F.pad(stats, (0, 0, 0, dist), value=0)
+                mag_mean = magnitude.mean(dim=[2, 3])   # [B, T-dist]
+                mag_std  = magnitude.std(dim=[2, 3])    # [B, T-dist]
+
+                # Spatial uniformity: fraction of pixels with near-zero motion.
+                # High uniformity = pan/zoom (content unchanged).
+                # Low uniformity  = scene change (spatially irregular diff).
+                threshold = mag_mean.unsqueeze(-1).unsqueeze(-1) * 0.5
+                # +1e-6: prevents threshold=0 on static frames where mag_mean=0.
+                # Without it: 0 < 0 is always False → uniformity=0 for static scenes
+                # (inverted signal — a perfectly static scene should score uniformity=1.0).
+                threshold = threshold + 1e-6
+                uniformity = (magnitude < threshold).float().mean(dim=[2, 3])  # [B, T-dist]
+
+                stats = torch.stack([mag_mean, mag_std, uniformity], dim=-1)  # [B, T-dist, 3]
+                # Zero-pad at the START: frames 0..dist-1 have no prior context
+                stats = F.pad(stats, (0, 0, dist, 0), value=0)   # [B, T, 3]
                 all_stats.append(stats)
             else:
-                # Distance too large, use zeros
                 all_stats.append(torch.zeros(B, T, 3, device=x.device))
         
-        # Concatenate all distances: [B, T, 15]
         motion_features = torch.cat(all_stats, dim=-1)
-        
         return motion_features
 
 
-class MotionDynamicsExtractor(nn.Module):
+class ProgressiveFusionBlock(nn.Module):
     """
-    Extract motion dynamics: acceleration and jerk FROM PIXEL MOTION
+    Progressive fusion with local + global patterns.
     
-    REDESIGNED: Now works on pixel-level motion features, not CNN features!
-    
-    TOP discriminators from empirical analysis:
-    - Acceleration (3.300 separation): Rate of change of motion
-    - Jerk (3.254 separation): Rate of change of acceleration
-    
-    Key insight:
-    - Gradual: smooth acceleration (content fading in/out)
-    - Pan: constant velocity (no acceleration)
-    - Cut: instant jump (infinite acceleration spike)
-    """
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, motion_magnitude):
-        """
-        Compute motion dynamics from pixel-level motion magnitude
-        
-        Args:
-            motion_magnitude: [B, T, 1] pixel motion magnitude (NOT CNN features!)
-        Returns:
-            acceleration: [B, T, 1] - rate of change of motion
-            jerk: [B, T, 1] - rate of change of acceleration
-        """
-        B, T, _ = motion_magnitude.shape
-        
-        # Velocity: change in motion (first derivative)
-        velocity = torch.zeros_like(motion_magnitude)
-        velocity[:, 1:] = motion_magnitude[:, 1:] - motion_magnitude[:, :-1]
-        
-        # Acceleration: change in velocity (second derivative)
-        acceleration = torch.zeros_like(motion_magnitude)
-        acceleration[:, 2:] = velocity[:, 2:] - velocity[:, 1:-1]
-        
-        # Jerk: change in acceleration (third derivative)
-        jerk = torch.zeros_like(motion_magnitude)
-        jerk[:, 3:] = acceleration[:, 3:] - acceleration[:, 2:-1]
-        
-        # Smooth with small window to reduce noise
-        acceleration = F.avg_pool1d(
-            acceleration.transpose(1, 2), 
-            kernel_size=3, stride=1, padding=1
-        ).transpose(1, 2)
-        
-        jerk = F.avg_pool1d(
-            jerk.transpose(1, 2),
-            kernel_size=3, stride=1, padding=1
-        ).transpose(1, 2)
-        
-        return acceleration, jerk
-
-
-class ReasoningModule(nn.Module):
-    """
-    REDESIGNED Reasoning Module - PIXEL-LEVEL Motion + LEARNABLE
-    
-    CRITICAL FIX: Now uses pixel-level motion features (FIX 1)
-    
-    Uses proven discriminative features:
-    1. Pixel motion magnitude/std/coherence (BEFORE CNN encoding)
-    2. Motion acceleration (3.300 separation) from pixel motion
-    3. Motion jerk (3.254 separation) from pixel motion  
-    4. Edge density variance (from spatial features)
-    
-    Makes features learnable via small MLPs to adapt to data patterns
-    """
-    def __init__(self, rgb_dim=640, pixel_motion_dim=15):
-        super().__init__()
-        
-        # Motion dynamics extractor (acceleration + jerk from PIXEL motion)
-        self.motion_dynamics = MotionDynamicsExtractor()
-        
-        # Pixel motion feature projection (15 dims → 64)
-        self.pixel_motion_proj = nn.Sequential(
-            nn.Linear(pixel_motion_dim, 64),
-            nn.LayerNorm(64),
-            nn.GELU()
-        )
-        
-        # Learnable fusion of motion dynamics (from pixel motion magnitude)
-        self.motion_fusion = nn.Sequential(
-            nn.Linear(2, 32),  # acceleration + jerk → 32
-            nn.LayerNorm(32),
-            nn.GELU()
-        )
-        
-        # Edge density from RGB spatial features (already has edge extractor)
-        # Extract norm of features as proxy for spatial activity
-        self.spatial_activity = nn.Sequential(
-            nn.Linear(rgb_dim, 64),
-            nn.LayerNorm(64),
-            nn.GELU()
-        )
-        
-    def forward(self, rgb_features, pixel_motion_features):
-        """
-        Args:
-            rgb_features: [B, T, 640] from RGB spatial encoder
-            pixel_motion_features: [B, T, 15] from PixelMotionExtractor (FIX 1!)
-        Returns:
-            reasoning_outputs: dict with discriminative signals
-        """
-        B, T, _ = rgb_features.shape
-        
-        # 1. PIXEL MOTION FEATURES (magnitude, std, coherence at 5 distances)
-        pixel_motion_logits = self.pixel_motion_proj(pixel_motion_features)  # [B, T, 64]
-        
-        # 2. MOTION DYNAMICS: Acceleration + Jerk from PIXEL motion magnitude
-        # Extract mean magnitude across all distances (column 0, 3, 6, 9, 12)
-        magnitude = pixel_motion_features[:, :, [0, 3, 6, 9, 12]].mean(dim=-1, keepdim=True)  # [B, T, 1]
-        acceleration, jerk = self.motion_dynamics(magnitude)  # [B, T, 1] each
-        motion_features = torch.cat([acceleration, jerk], dim=-1)  # [B, T, 2]
-        motion_logits = self.motion_fusion(motion_features)  # [B, T, 32]
-        
-        # 3. SPATIAL ACTIVITY: Edge density from RGB features
-        spatial_logits = self.spatial_activity(rgb_features)  # [B, T, 64]
-        
-        # Combine all discriminative signals
-        combined = torch.cat([
-            pixel_motion_logits,  # [B, T, 64] - raw pixel motion stats (FIX 1!)
-            motion_logits,        # [B, T, 32] - acceleration/jerk from pixel motion
-            spatial_logits        # [B, T, 64] - edge density
-        ], dim=-1)  # [B, T, 160]
-        
-        # Return as reasoning outputs (learnable features)
-        reasoning_outputs = {
-            'combined': combined,  # [B, T, 160] - all discriminative features
-            'acceleration': acceleration,  # [B, T, 1] - for monitoring
-            'jerk': jerk,  # [B, T, 1] - for monitoring
-            'pixel_motion': pixel_motion_features  # [B, T, 15] - for monitoring
-        }
-        
-        return reasoning_outputs
-
-
-class BoundaryDetectionHead(nn.Module):
-    """
-    TWO-STAGE detection head (FIX 6B)
-    
-    Stage 1: Boundary vs None (binary)
-    Stage 2: IF boundary, what type? (Cut vs Gradual - binary on boundaries only)
-    
-    This prevents the model from learning "none looks like gradual"
-    
-    IMPROVEMENTS:
-    - Temporal pyramid pooling (length-invariant)
-    - Gradual-specific features (FIX 5)
-    - Two-stage prediction (cleaner separation)
+    1. Local patterns (dilated convs) - primary signal, covers 1-127 frame range
+    2. Global context (attention) - refinement
+    3. Gated fusion - learn what to keep from each
     """
     def __init__(self, dim):
         super().__init__()
         
-        # Temporal Pyramid Pooling (simplified)
-        self.temporal_pyramid = TemporalPyramidPooling(dim, pyramid_levels=[1, 4, 8])
+        self.local_conv = MultiScaleDilatedConv(dim)
+        self.global_attn = LightweightTemporalAttention(dim)
         
-        # Gradual transition detector (FIX 5)
-        self.gradual_detector = GradualTransitionDetector(dim)
-        
-        # Temporal consistency pooling (reduced to 2 scales)
-        self.consistency_pools = nn.ModuleList([
-            nn.AvgPool1d(kernel_size=k, stride=1, padding=k//2)
-            for k in [11, 25]  # Short and medium gradual windows
-        ])
-        
-        # Feature refinement (pyramid + 2 consistency + gradual + original)
-        self.refine = nn.Sequential(
-            nn.Linear(dim * 4 + 32, dim),  # pyramid + original + 2 consistency + gradual
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(0.1),
+            nn.Sigmoid()
+        )
+
+        # fusion now takes dim input (the gated-weighted blend), not dim*2
+        self.fusion = nn.Sequential(
+            nn.Linear(dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(0.1)
-        )
-        
-        # STAGE 1: Binary boundary detection (LIGHTWEIGHT: 2 layers instead of 3)
-        self.boundary_head = nn.Sequential(
-            nn.Linear(dim, dim // 2),
-            nn.LayerNorm(dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(dim // 2, 1)
-        )
-        
-        # STAGE 2: Type classification (LIGHTWEIGHT: 2 layers instead of 3)
-        # Operates on features enriched with gradual detector
-        self.type_head = nn.Sequential(
-            nn.Linear(dim + 32, dim // 2),  # Direct to half-dim
-            nn.LayerNorm(dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(dim // 2, 2)  # Cut=0, Gradual=1 (no "none" option!)
+            nn.Dropout(0.1),
         )
         
     def forward(self, x):
         """
         Args:
-            x: [B, T, C] temporal features (already enriched with reasoning)
+            x: [B, T, C] temporal features
         Returns:
-            boundary_logits: [B, T, 1]
-            type_logits: [B, T, 3] - 3-CLASS (none=0, cut=1, gradual=2) - constructed from 2-stage
+            [B, T, C] fused local + global features
         """
-        # Temporal Pyramid Pooling
-        pyramid_features = self.temporal_pyramid(x)  # [B, T, C]
+        local_feat  = self.local_conv(x)
+        global_feat = self.global_attn(local_feat)  # attention refines local conv output, not raw x
+
+        combined     = torch.cat([local_feat, global_feat], dim=-1)  # [B, T, dim*2]
+        gate_weight  = self.gate(combined)                            # [B, T, dim] in (0,1)
+        # Soft gate: weight local vs global rather than adding both unconditionally.
+        # gate≈1 → trust local (dilated conv); gate≈0 → trust global (attention).
+        weighted = gate_weight * local_feat + (1 - gate_weight) * global_feat
+        return x + self.fusion(weighted)  # residual connection around the whole block
+
+
+class DualBoundaryHead(nn.Module):
+    """
+    AutoShot-style dual-head boundary detection.
+    
+    Head y (one_hot):  Predicts whether each frame is the MIDPOINT of a transition.
+                       Cuts: midpoint = the cut frame itself.
+                       Graduals: midpoint = center of the gradual span.
+                       
+    Head z (many_hot): Predicts whether each frame is part of a gradual transition.
+                       Cuts: all zeros (instantaneous, no span).
+                       Graduals: 1 for every frame in the gradual span.
+    
+    Training:
+        L = lambda1 * FocalBCE(y_hat, y_one_hot) + lambda2 * FocalBCE(z_hat, z_many_hot)
+        lambda1 = 5.0 (primary), lambda2 = 0.1 (auxiliary)
+    
+    Inference:
+        1. Detect peaks in sigmoid(y_logits) > threshold -> transition locations
+        2. For each peak, check sigmoid(z_logits) around it:
+           - High z -> gradual transition
+           - Low z  -> hard cut
+    
+    WHY THIS WORKS:
+    - one_hot forces exactly 1 prediction per transition -> inherent sparsity
+    - many_hot captures gradual extent without contributing to boundary count
+    - No gradient contamination between detection and classification
+    - Natural type inference from the relationship between y and z
+    """
+    def __init__(self, dim):
+        super().__init__()
         
-        # Gradual-specific features (FIX 5)
-        gradual_features = self.gradual_detector(x)  # [B, T, 32]
-        
-        # Temporal consistency features (variance over windows)
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        consistency_features = []
-        for pool in self.consistency_pools:
-            pooled_mean = pool(x_t)  # [B, C, T]
-            pooled_sq = pool(x_t ** 2)
-            variance_feat = pooled_sq - pooled_mean ** 2
-            variance_feat = torch.clamp(variance_feat, min=0)
-            consistency_features.append(variance_feat.transpose(1, 2))  # [B, T, C]
-        
-        # Concatenate: original + pyramid + 2 consistency + gradual
-        multi_scale = torch.cat([x, pyramid_features] + consistency_features + [gradual_features], dim=-1)
-        
-        # Refine features
-        refined = self.refine(multi_scale)
-        
-        # STAGE 1: Boundary detection (binary)
-        boundary_logits = self.boundary_head(refined)  # [B, T, 1]
-        
-        # STAGE 2: Type classification (Cut vs Gradual only)
-        # Enrich with gradual-specific features
-        type_input = torch.cat([refined, gradual_features], dim=-1)
-        type_logits_2class = self.type_head(type_input)  # [B, T, 2] - Cut/Gradual only
-        
-        # Convert 2-class to 3-class format: [none, cut, gradual]
-        # If boundary=0, type=none (logit 0). If boundary=1, use type_logits_2class
-        B, T, _ = x.shape
-        type_logits_3class = torch.zeros(B, T, 3, device=x.device, dtype=x.dtype)
-        # None logit = -boundary_logits (high when boundary is low)
-        type_logits_3class[:, :, 0] = -boundary_logits.squeeze(-1)
-        # Cut/Gradual logits from type head
-        type_logits_3class[:, :, 1:] = type_logits_2class
-        
-        return boundary_logits, type_logits_3class
+        # SEPARATE refine blocks per head -- y and z have incompatible target densities:
+        #   y-head (one_hot):  ~0.8% positive (1 midpoint per 128-frame clip)
+        #   z-head (many_hot): ~0-20% positive (0 for cut clips, 10-20 frames for graduals)
+        # A shared refine block averages contradictory gradients, causing y-head to fire
+        # on every gradual frame (many_hot leakage) -> FP burst on all gradual transitions.
+        self.refine_y = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
+        self.refine_z = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
+
+        # Head y: one_hot midpoint (PRIMARY)
+        # Prior ~0.8% positive (1 transition per 128-frame clip).
+        # Init bias = log(p/(1-p)) = log(0.008/0.992) ~= -4.82 so sigmoid(logit) ~= 0.008
+        # at init. Without this, bias~0 -> sigmoid~0.5 -> ~64 FPs/clip before any training.
+        # This is the RetinaNet focal-loss bias initialisation trick.
+        self.head_y = nn.Linear(dim // 2, 1)
+        nn.init.constant_(self.head_y.bias, -4.82)   # RetinaNet prior: sigmoid(-4.82) ~= 0.008
+
+        # Head z: many_hot gradual extent (AUXILIARY)
+        # Prior ~2.1% positive: 79% cut-clips have all-zero z-targets;
+        # gradual-clips average ~13 positive frames / 128 total.
+        # bias = log(0.021/0.979) ~= -3.85
+        self.head_z = nn.Linear(dim // 2, 1)
+        nn.init.constant_(self.head_z.bias, -3.85)   # RetinaNet prior: sigmoid(-3.85) ~= 0.021
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, T, C] temporal features from fusion blocks
+        Returns:
+            y_logits: [B, T, 1] - one_hot midpoint predictions
+            z_logits: [B, T, 1] - many_hot gradual extent predictions
+        """
+        y_logits = self.head_y(self.refine_y(x))
+        z_logits = self.head_z(self.refine_z(x))
+        return y_logits, z_logits
 
 
 class HybridBoundaryDetector(nn.Module):
     """
-    Hybrid Boundary Detector - 2026 REDESIGNED with Empirical Features
+    Hybrid Boundary Detector with AutoShot-Style Dual Heads.
     
-    REDESIGN BASED ON FEATURE ANALYSIS:
-    ✓ Motion acceleration (3.300 separation) - rate of change of motion
-    ✓ Motion jerk (3.254 separation) - rate of change of acceleration
-    ✓ Edge density variance (3.172 separation) - content emergence vs translation
-    ✓ Removed: histogram (1.3), temporal similarity (0.99) - weak discriminators
+    Combines proven feature extraction with AutoShot's dual-head training:
+    - Dual spatial encoders (RGB + multi-distance diffs) with edge extraction
+    - Pixel-level motion features (before CNN encoding)
+    - Color histogram features (gradual detection via palette shifts)
+    - Progressive fusion blocks (dilated convs + attention)
+    - Dual boundary heads (one_hot midpoint + many_hot extent)
     
-    KEY INSIGHT:
-    Graduals vs smooth pans have IDENTICAL RGB features but DIFFERENT motion dynamics:
-    - Gradual: smooth acceleration (content fading)
-    - Pan: zero acceleration (constant velocity)
-    
-    ARCHITECTURE:
-    - Dual encoders (RGB + multi-distance diffs) with edge extraction
-    - Motion dynamics extractor (acceleration + jerk from diffs)
-    - Learnable reasoning module (motion + spatial + coherence)
-    - Progressive fusion blocks (local→global)
-    - Binary boundary + 3-class type heads
-    
-    FOCUSED DESIGN:
-    - Spatial encoders: 640 dims (512 attention + 128 edge features)
-    - Reasoning: 160 dims (32 motion + 64 spatial + 64 coherence) 
-    - Main processing: configurable (default 384)
-    - Total: ~8-10M params (proven effective range)
+    Feature pipeline (proportional projection → no gradient dilution or over-compression):
+      RGB 640 → main_dim//2 | Diff 640 → main_dim//2 | FrameSim 128 → main_dim//4
+      ColorHistSim 128 → main_dim//4 | Motion 15 → 32
+      concat → 2-step MLP → main_dim
     """
-    def __init__(self, main_dim=512, num_fusion_blocks=4):
+    def __init__(self, main_dim=512, num_fusion_blocks=3):
         super().__init__()
         
-        # PIXEL-LEVEL motion extractor (FIX 1 - BEFORE CNN encoding!)
+        # Pixel-level motion extractor (BEFORE CNN encoding)
         self.pixel_motion_extractor = PixelMotionExtractor()
-        
-        # Spatial encoders: 640 dims each (512 attention + 128 edge features)
-        self.rgb_encoder = EfficientSpatialEncoder(input_channels=3, output_dim=512)
-        self.diff_encoder = EfficientSpatialEncoder(input_channels=12, output_dim=512)
-        
-        # Feature fusion: FOCUSED on discriminative features
-        # Input: 640 (RGB) + 640 (diff) + 15 (pixel motion) = 1,295 dims
-        # NEW: Added pixel-level motion features (FIX 1)
-        # OPTIMIZED: Single projection layer (was 2-layer bottleneck)
-        feature_input_dim = 640 + 640 + 15
+
+        # Dual spatial encoders: 640 dims each (output_dim=512 + 128 edge)
+        # The 3D stem blends ±7 temporal neighbours at pixel level.
+        # Use rgb_encoder.forward_per_frame() for FrameSimilarity and feat_delta.
+        self.rgb_encoder  = EfficientSpatialEncoder(input_channels=3,  output_dim=512)
+        self.diff_encoder = EfficientSpatialEncoder(input_channels=15, output_dim=512)
+        # Note: per_frame_features reuse rgb_encoder's body via forward_per_frame().
+        # No separate encoder needed — zero duplicate conv computation.
+
+        # AutoShot-style similarity features (the dominant discriminators)
+        # Three temporal scales give explicit short / medium / long-range context:
+        #   window  15 — cuts:      similarity collapses in a single step
+        #   window  51 — quick fades (10-25 frames): partial overlap visible
+        #   window 127 — slow dissolves (50-100 frames): broad V-shaped dip
+        # Each outputs 64-d; concat → 192-d → projected to sim_dim in frame_sim_proj.
+        # A single 127-frame window cannot distinguish a 1-frame cut from a 100-frame
+        # dissolve — both look like a dip, just at different widths.
+        self.frame_sim_short  = FrameSimilarity(
+            in_channels=640, lookup_window=15,  output_dim=64
+        )
+        self.frame_sim_medium = FrameSimilarity(
+            in_channels=640, lookup_window=51,  output_dim=64
+        )
+        self.frame_sim_long   = FrameSimilarity(
+            in_channels=640, lookup_window=127, output_dim=64
+        )
+        # ColorHistogramSimilarity: pairwise palette distance -> [B,T,128]
+        self.color_hist_similarity = ColorHistogramSimilarity(
+            num_bins=64, lookup_window=127, output_dim=128
+        )
+
+        # Feature-space dropout applied to rgb_features BEFORE FrameSimilarity.
+        # Spatial augmentations (brightness/contrast/noise) are invariant to L2-norm —
+        # they change feature magnitude, which cosine similarity ignores entirely.
+        # Dropout changes the feature DIRECTION after L2-norm, giving a different
+        # [T,T] similarity matrix each forward pass for the same clip.
+        # This is the only effective augmentation against FrameSimilarity memorization.
+        self.feat_dropout = nn.Dropout(p=0.15)
+
+        # Per-stream projections: proportional to information content.
+        #   RGB   640 → main_dim//2  (primary, most info-rich — 3D stem features)
+        #   Diff  640 → main_dim//2  (primary — 3D stem on multi-dist diffs)
+        #   Feat delta 640 → 64      (2D per-frame features — sharp cut spike)
+        #   FSim  128 → main_dim//4  (key discriminator — 2D per-frame cosine sims)
+        #   CSim  128 → main_dim//4  (key discriminator — palette sims)
+        #   Motion 15               (raw — already compact, no compression needed)
+        rgb_dim    = main_dim // 2   # 256 for main_dim=512
+        diff_dim   = main_dim // 2   # 256
+        delta_dim  = 64              # feature-level delta: fixed small dim
+        sim_dim    = main_dim // 4   # 128
+        motion_out = 15              # pass raw motion features — no projection loss
+        fuse_in    = rgb_dim + diff_dim + delta_dim + sim_dim + sim_dim + motion_out
+        # = 256 + 256 + 64 + 128 + 128 + 15 = 847 for main_dim=512
+
+        self.rgb_proj = nn.Sequential(
+            nn.Linear(640, rgb_dim), nn.LayerNorm(rgb_dim), nn.GELU()
+        )
+        self.diff_proj = nn.Sequential(
+            nn.Linear(640, diff_dim), nn.LayerNorm(diff_dim), nn.GELU()
+        )
+        # Feature-level temporal delta on 2D per-frame features (sharp — no 3D blur).
+        self.feat_delta_proj = nn.Sequential(
+            nn.Linear(640, delta_dim), nn.LayerNorm(delta_dim), nn.GELU()
+        )
+        self.frame_sim_proj = nn.Sequential(
+            nn.Linear(192, sim_dim), nn.LayerNorm(sim_dim), nn.GELU()  # 3×64 → sim_dim
+        )
+        self.color_sim_proj = nn.Sequential(
+            nn.Linear(128, sim_dim), nn.LayerNorm(sim_dim), nn.GELU()
+        )
+        # No motion_proj: PixelMotionExtractor's 15 features are already compact
+        # hard-engineered statistics — compressing to 10 only discards information.
+        # BUT they are raw pixel-scale values (mag_mean ~0.01-0.05, uniformity 0-1),
+        # i.e. 10-100x smaller than LayerNorm-normalized streams.
+        # A shared Linear(847->1024) cannot weight these fairly without scaling them.
+        # LayerNorm (no affine compression) re-centres + unit-std without losing the
+        # relative magnitudes between motion dimensions.
+        self.motion_norm = nn.LayerNorm(motion_out)
+
+        # Two-step mixer: fuse_in → 2×main_dim → main_dim
+        # Expansion step lets streams interact before final compression.
         self.feature_proj = nn.Sequential(
-            nn.Linear(feature_input_dim, main_dim),  # Direct projection (more efficient!)
+            nn.Linear(fuse_in, main_dim * 2),
+            nn.LayerNorm(main_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.35),
+            nn.Linear(main_dim * 2, main_dim),
             nn.LayerNorm(main_dim),
             nn.GELU(),
-            nn.Dropout(0.15)
+            nn.Dropout(0.15),
         )
         
-        # Progressive fusion blocks at MAIN dimension (FIX 2 integrated)
+        # Progressive fusion blocks (dilated convs + attention)
         self.fusion_blocks = nn.ModuleList([
             ProgressiveFusionBlock(main_dim)
             for _ in range(num_fusion_blocks)
         ])
         
-        # Reasoning module (REDESIGNED - pixel-level motion + learnable)
-        # Takes rgb_features and PIXEL motion features (not diff_features!)
-        self.reasoning_module = ReasoningModule(rgb_dim=640, pixel_motion_dim=15)
-        
-        # Final boundary detection head at MAIN dimension (FIX 5, FIX 6B integrated)
-        self.detection_head = BoundaryDetectionHead(main_dim)
-        
-        # Enrichment projection
-        # Reasoning outputs 160 dims (64 pixel motion + 32 dynamics + 64 spatial)
-        self.enrichment_proj = nn.Linear(main_dim + 160, main_dim)
+        # Dual boundary head (AutoShot-style)
+        self.detection_head = DualBoundaryHead(main_dim)
         
         self.main_dim = main_dim
         
@@ -1183,96 +773,91 @@ class HybridBoundaryDetector(nn.Module):
         """
         Args:
             x: [B, T, C, H, W] video frames (typically T=128, C=3, H=48, W=64)
-            return_features: If True, return intermediate features
+            return_features: If True, return intermediate features dict
             
         Returns:
-            boundary_logits: [B, T, 1] - binary boundary detection
-            type_logits: [B, T, 3] - 3-class (none, cut, gradual)
-            
-        Note: Reasoning features are used internally to enrich representations
-              but NOT supervised directly (they're too ambiguous - graduals and 
-              smooth pans have identical reasoning features!)
+            y_logits: [B, T, 1] - one_hot midpoint predictions
+            z_logits: [B, T, 1] - many_hot gradual extent predictions
         """
         B, T, C, H, W = x.shape
         
-        # 1. FIX 1: Extract pixel-level motion features BEFORE CNN encoding!
-        # This preserves motion coherence that CNN pooling destroys
+        # 1. Extract pixel-level motion features BEFORE CNN encoding
         pixel_motion_features = self.pixel_motion_extractor(x)  # [B, T, 15]
         
-        # 2. EFFICIENT: Compute multi-distance differences as stacked channels
-        # Instead of encoding each distance separately (4x slower!), 
-        # we stack them as channels and encode ONCE
-        diff_distances = [1, 4, 8, 16]
-        
-        # Pre-allocate stacked difference tensor: [B, T, C*len(distances), H, W]
+        # 2. Compute multi-distance differences as stacked channels
+        # [1,4,8,16,32]: distance 32 explicitly encodes mid-dissolve blend ratios.
+        diff_distances = [1, 4, 8, 16, 32]
         all_diffs = torch.zeros(B, T, C * len(diff_distances), H, W, device=x.device, dtype=x.dtype)
-        
         for i, dist in enumerate(diff_distances):
             if dist < T:
                 all_diffs[:, dist:, i*C:(i+1)*C] = x[:, dist:] - x[:, :-dist]
         
-        # 3. Spatial encoding: Edge extraction + attention pooling
-        x_flat = x.reshape(B * T, C, H, W)
-        diff_flat = all_diffs.reshape(B * T, C * len(diff_distances), H, W)
+        # 3. Spatial encoding
+        # Two paths through EfficientSpatialEncoder — same body weights, different stems:
+        #   forward()           — 3D stem (±7 frame RF): blends temporal context.
+        #                         Good for rgb_features, diff_features (gradual  detection).
+        #   forward_per_frame() — 2D only (no temporal mix): preserves sharp per-frame.
+        #                         Required for FrameSimilarity + feat_delta so cut spikes
+        #                         are not smeared across neighbours before cosine sim.
+        rgb_features      = self.rgb_encoder(x)               # [B, T, 640] — 3D stem
+        diff_features     = self.diff_encoder(all_diffs)       # [B, T, 640] — 3D stem on diffs
+        per_frame_feats   = self.rgb_encoder.forward_per_frame(x)  # [B, T, 640] — 2D only, sharp
+
+        # 4. Feature-level temporal delta on SHARP per-frame features.
+        # Backward difference: feat_delta[t] = pf[t] - pf[t-1].
+        # Fires AT the cut frame; using 3D features would spread the spike over ±7 frames.
+        feat_delta = torch.zeros_like(per_frame_feats)             # [B, T, 640]
+        feat_delta[:, 1:] = per_frame_feats[:, 1:] - per_frame_feats[:, :-1]
+        # Normalize by per-clip mean absolute delta (a single scalar per clip).
+        # This preserves the temporal contrast: cut frames have large ||delta||,
+        # scene frames have small ||delta|| — the ratio is the discriminative signal.
+        # Per-dimension temporal std (previous approach) destroyed this: on a
+        # scene-only clip all deltas are noise -> std is tiny -> noise gets amplified
+        # to the same O(1) magnitude as a real cut frame after division.
+        clip_scale = feat_delta.abs().mean(dim=(1, 2), keepdim=True).clamp(min=1e-6)  # [B,1,1]
+        feat_delta = feat_delta / clip_scale
+
+        # 5. AutoShot-style similarity features — use SHARP per-frame features.
+        # Using 3D features here would pre-smooth the [T,T] similarity matrix and mask
+        # the single-frame dip that distinguishes cuts from graduals.
+        # Three scales: short=cuts, medium=quick fades, long=slow dissolves.
+        rgb_for_sim             = self.feat_dropout(per_frame_feats)           # direction noise
+        frame_sim_features      = torch.cat([
+            self.frame_sim_short(rgb_for_sim),   # [B, T, 64]  — cut-scale
+            self.frame_sim_medium(rgb_for_sim),  # [B, T, 64]  — quick-fade scale
+            self.frame_sim_long(rgb_for_sim),    # [B, T, 64]  — dissolve scale
+        ], dim=-1)                               # [B, T, 192]
+        color_hist_sim_features = self.color_hist_similarity(x)                # [B, T, 128]
+
+        # 6. Per-stream projection (proportional gradient budget)
+        rgb_proj   = self.rgb_proj(rgb_features)
+        diff_proj  = self.diff_proj(diff_features)
+        delta_proj = self.feat_delta_proj(feat_delta)
+        fsim_proj  = self.frame_sim_proj(frame_sim_features)
+        csim_proj  = self.color_sim_proj(color_hist_sim_features)
+        mot_proj   = self.motion_norm(pixel_motion_features)   # scale to O(1), same as other streams
+
+        combined = torch.cat([rgb_proj, diff_proj, delta_proj, fsim_proj, csim_proj, mot_proj], dim=-1)
+        x_proj = self.feature_proj(combined)  # [B, T, main_dim]
         
-        # RGB features: 640 dims (512 attention + 128 edge features)
-        rgb_features = self.rgb_encoder(x_flat)  # [B*T, 640]
-        rgb_features = rgb_features.reshape(B, T, -1)  # [B, T, 640]
-        
-        # Difference features: 640 dims (512 attention + 128 edge features)
-        diff_features = self.diff_encoder(diff_flat)  # [B*T, 640]
-        diff_features = diff_features.reshape(B, T, -1)  # [B, T, 640]
-        
-        # 4. Combine ALL features: RGB + diff + pixel motion
-        # Total: 640 + 640 + 15 = 1,295 dims
-        combined = torch.cat([rgb_features, diff_features, pixel_motion_features], dim=-1)
-        x = self.feature_proj(combined)  # [B, T, main_dim]
-        
-        # 5. REASONING: Extract motion dynamics from PIXEL motion (FIX 1!)
-        # CRITICAL: Compute BEFORE fusion blocks to preserve raw signals!
-        # Acceleration/jerk now computed from pixel-level motion, not CNN features
-        reasoning_outputs = self.reasoning_module(rgb_features, pixel_motion_features)
-        
-        # Get combined reasoning features (160 dims: pixel motion + dynamics + spatial)
-        reasoning_combined = reasoning_outputs['combined']  # [B, T, 160]
-        
-        # Enrich fused features with reasoning signals
-        x_enriched = torch.cat([x, reasoning_combined], dim=-1)  # [B, T, main_dim+160]
-        
-        # Project back to main_dim using properly initialized layer from __init__
-        x = self.enrichment_proj(x_enriched)
-        
-        # 6. Progressive fusion (FIX 2: multi-level + local + global)
+        # 7. Progressive fusion
         for fusion_block in self.fusion_blocks:
-            x = fusion_block(x)
+            x_proj = fusion_block(x_proj)
         
-        # 7. Boundary & type detection (FIX 5: gradual detector, FIX 6B: two-stage)
-        boundary_logits, type_logits_raw = self.detection_head(x)
-        
-        # FIX 6A: REMOVE DETACHED GATING - allow gradient flow!
-        # Two-stage head already handles this structurally (none logit = -boundary)
-        # No need for manual gating that blocks gradients
-        type_logits = type_logits_raw  # Use raw logits directly
-        # FIX 6A: REMOVE DETACHED GATING - allow gradient flow!
-        # Two-stage head already handles this structurally (none logit = -boundary)
-        # No need for manual gating that blocks gradients
-        type_logits = type_logits_raw  # Use raw logits directly
+        # 8. Dual head detection
+        y_logits, z_logits = self.detection_head(x_proj)
         
         if return_features:
-            return boundary_logits, type_logits, {
+            return y_logits, z_logits, {
                 'rgb': rgb_features,
                 'diff': diff_features,
-                'pixel_motion': pixel_motion_features,  # NEW: pixel motion features
-                'fused': x,
-                'reasoning': reasoning_outputs,
-                'acceleration': reasoning_outputs['acceleration'],
-                'jerk': reasoning_outputs['jerk']
+                'pixel_motion': pixel_motion_features,
+                'frame_sim': frame_sim_features,
+                'color_hist_sim': color_hist_sim_features,
+                'fused': x_proj
             }
         
-        # Return outputs for training
-        # type_logits is SAME as type_logits_raw now (no gating!)
-        # Return both for compatibility, but they're identical
-        return boundary_logits, type_logits, reasoning_outputs, type_logits
+        return y_logits, z_logits
     
     def count_parameters(self):
         """Count total and trainable parameters"""
@@ -1281,49 +866,41 @@ class HybridBoundaryDetector(nn.Module):
         return total, trainable
 
 
-def create_hybrid_detector(main_dim=512, num_fusion_blocks=4):
+def create_hybrid_detector(main_dim=512, num_fusion_blocks=3):
     """
-    Factory function for creating Hybrid Boundary Detector
+    Factory function for creating Hybrid Boundary Detector.
     
     Args:
-        main_dim: Main processing dimension (default 512 for competitive capacity)
-                  This is used for fusion blocks and detection heads.
-                  Component dims are FIXED: spatial=256, histogram=128, similarity=128
-                  TransNetV2 uses 1024, recommended 384-768 for our architecture
-        num_fusion_blocks: Number of progressive fusion blocks (default 4)
+        main_dim: Main processing dimension (default 512)
+        num_fusion_blocks: Number of progressive fusion blocks (default 3)
     
     Returns:
         HybridBoundaryDetector model
     """
-    print("="*80)
-    print("Creating Hybrid Boundary Detector - 2026 COMPREHENSIVE REDESIGN")
-    print("="*80)
-    print("\nCRITICAL ARCHITECTURAL FIXES IMPLEMENTED:")
-    print("  ✅ FIX 1: Pixel-level motion features (BEFORE CNN encoding!)")
-    print("     - Magnitude, std, coherence at 5 temporal distances")
-    print("     - Preserves motion coherence that CNN pooling destroys")
-    print("  ✅ FIX 2: Multi-level temporal aggregation")
-    print("     - Global + long (96 frames) + medium + short range")
-    print("     - Can now see full 81-frame gradual transitions")
-    print("  ✅ FIX 5: Gradual transition detector")
-    print("     - Specialized for long monotonic changes (21-81 frame windows)")
-    print("     - Smoothness gating (low variance = gradual)")
-    print("  ✅ FIX 6A: Removed detached gating - clean gradient flow")
-    print("  ✅ FIX 6B: Two-stage type prediction (boundary first, then type)")
-    print("     - Prevents 'none looks like gradual' confusion")
+    print("=" * 80)
+    print("Creating Hybrid Boundary Detector - AutoShot-Style Dual Heads")
+    print("=" * 80)
     
-    print("\nKEY INSIGHT:")
-    print("  Graduals vs smooth pans are INDISTINGUISHABLE after CNN encoding!")
-    print("  Solution: Extract motion BEFORE spatial pooling destroys coherence")
-    print("  Motion coherence (pan=0.9, gradual=0.3) is the key discriminator")
+    print("\nDUAL HEAD DESIGN (AutoShot approach):")
+    print("  Head y (one_hot):  Midpoint of each transition (primary, lambda=5.0)")
+    print("  Head z (many_hot): All frames in gradual transitions (auxiliary, lambda=0.1)")
+    print("  Loss: L = 5.0 * FocalBCE(y, one_hot) + 0.1 * FocalBCE(z, many_hot)")
     
-    print("\nREDESIGNED COMPONENTS:")
-    print("  + PixelMotionExtractor - extracts motion before CNN")
-    print("  + MultiLevelTemporalAggregation - sees long graduals (96 frames)")
-    print("  + GradualTransitionDetector - specialized for graduals")
-    print("  + MotionDynamicsExtractor - now uses pixel motion, not CNN features")
-    print("  + Two-stage type head - boundary detection → type classification")
-    print("  - Removed detached gating - clean gradient flow")
+    print("\nCORE COMPONENTS (proven effective):")
+    print("  - Pixel-level motion features (before CNN encoding)")
+    print("  - FrameSimilarity: CNN-level cosine sim in ±63 frame window (AutoShot key)")
+    print("  - ColorHistogramSimilarity: palette cosine sim in ±63 frame window (AutoShot key)")
+    print("  - Dual spatial encoders (RGB + multi-distance diffs)")
+    print("  - Edge density extractor (3.172 separation score)")
+    print("  - Multi-scale dilated convs (dilations 1, 4, 16, 64)")
+    print("  - Lightweight temporal attention (global context)")
+    print("  - Progressive fusion blocks (gated local + global)")
+    
+    print("\nREMOVED (dead weight):")
+    print("  - ReasoningModule + MotionDynamicsExtractor (accel/jerk not discriminative)")
+    print("  - TemporalSimilarity, MultiLevelTemporalAggregation (redundant)")
+    print("  - TemporalPyramidPooling, GradualTransitionDetector (covered by dilated convs)")
+    print("  - Old type head with gradient contamination")
     
     model = HybridBoundaryDetector(
         main_dim=main_dim,
@@ -1336,74 +913,53 @@ def create_hybrid_detector(main_dim=512, num_fusion_blocks=4):
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Memory footprint: ~{total_params * 4 / 1024 / 1024:.1f} MB (fp32)")
+    print(f"  Main processing dim: {main_dim}")
+    print(f"  Fusion blocks: {num_fusion_blocks}")
     
-    print(f"\nARCHITECTURE DIMENSIONS:")
-    print(f"  Spatial encoders: 640 dims (512 attention + 128 edge)")
-    print(f"  Pixel motion: 15 dims (5 distances × 3 stats)")
-    print(f"  Reasoning module: 160 dims (64 motion + 32 dynamics + 64 spatial)")
-    print(f"  Main processing: {main_dim} dims (fusion + detection)")
-    print(f"\nCOMPARISON:")
-    print(f"  TransNetV2: ~7.0M params")
-    print(f"  Previous model: ~{total_params/1e6:.1f}M params (motion from CNN features - WRONG!)")
-    print(f"  This model: {total_params/1e6:.1f}M params (motion from PIXELS - CORRECT!)")
-    print(f"  Target range: 10-15M params (competitive with AutoShot)")
-    
-    print("\n" + "="*80)
+    print(f"\nTARGET: Beat AutoShot F1~0.85 on ClipShots")
+    print("=" * 80)
     
     return model
 
 
 if __name__ == '__main__':
-    print("\n" + "="*80)
-    print("TESTING HYBRID BOUNDARY DETECTOR")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print("TESTING HYBRID BOUNDARY DETECTOR (Dual Head)")
+    print("=" * 80)
     
-    # Create model with default settings
     model = create_hybrid_detector(main_dim=256, num_fusion_blocks=3)
     
-    # Test forward pass
     print("\nTesting forward pass...")
-    batch = torch.randn(2, 128, 3, 48, 64)  # Typical ClipShots input
+    batch = torch.randn(2, 128, 3, 48, 64)
     print(f"Input shape: {batch.shape}")
     
     with torch.no_grad():
-        boundary_logits, type_logits, reasoning = model(batch)
+        y_logits, z_logits = model(batch)
     
     print(f"\nOutput shapes:")
-    print(f"  Boundary logits: {boundary_logits.shape} (expected: [2, 128, 1])")
-    print(f"  Type logits: {type_logits.shape} (expected: [2, 128, 3])")
+    print(f"  y_logits (one_hot):  {y_logits.shape} (expected: [2, 128, 1])")
+    print(f"  z_logits (many_hot): {z_logits.shape} (expected: [2, 128, 1])")
     
-    print(f"\nReasoning outputs (motion dynamics from PIXEL motion):")
-    print(f"  Combined features: {reasoning['combined'].shape} - pixel motion+dynamics+spatial")
-    print(f"  Acceleration: {reasoning['acceleration'].shape} - from pixel motion (not CNN!)")
-    print(f"  Jerk: {reasoning['jerk'].shape} - from pixel motion (not CNN!)")
-    print(f"  Pixel motion: {reasoning['pixel_motion'].shape} - mag/std/coherence at 5 distances")
-    
-    # Analyze predictions
-    boundary_probs = torch.sigmoid(boundary_logits)
-    type_probs = torch.softmax(type_logits, dim=-1)
+    y_probs = torch.sigmoid(y_logits)
+    z_probs = torch.sigmoid(z_logits)
     
     print(f"\nPrediction analysis:")
-    print(f"  Boundary probs range: [{boundary_probs.min():.4f}, {boundary_probs.max():.4f}]")
-    print(f"  Type probs (none): [{type_probs[:,:,0].min():.4f}, {type_probs[:,:,0].max():.4f}]")
-    print(f"  Type probs (cut): [{type_probs[:,:,1].min():.4f}, {type_probs[:,:,1].max():.4f}]")
-    print(f"  Type probs (gradual): [{type_probs[:,:,2].min():.4f}, {type_probs[:,:,2].max():.4f}]")
+    print(f"  y_probs range: [{y_probs.min():.4f}, {y_probs.max():.4f}]")
+    print(f"  z_probs range: [{z_probs.min():.4f}, {z_probs.max():.4f}]")
     
-    print(f"\nMotion dynamics analysis (from pixel-level motion):")
-    print(f"  Acceleration: [{reasoning['acceleration'].min():.4f}, {reasoning['acceleration'].max():.4f}]")
-    print(f"  Jerk: [{reasoning['jerk'].min():.4f}, {reasoning['jerk'].max():.4f}]")
-    print(f"\nPixel motion coherence (HIGH=pan, LOW=gradual):")
-    # Extract coherence features (every 3rd column: 2, 5, 8, 11, 14)
-    coherence = reasoning['pixel_motion'][:, :, [2, 5, 8, 11, 14]]
-    print(f"  Mean coherence: {coherence.mean():.4f} (expect: pan~0.7-0.9, gradual~0.2-0.4)")
-    
-    # Count predicted boundaries
     for threshold in [0.5, 0.6, 0.7]:
-        n_boundaries = (boundary_probs.squeeze(-1) > threshold).sum().item()
+        n_boundaries = (y_probs.squeeze(-1) > threshold).sum().item()
         total_frames = batch.shape[0] * batch.shape[1]
         sparsity = 100 * (1 - n_boundaries / total_frames)
-        print(f"  Predicted boundaries (p>{threshold}): {n_boundaries}/{total_frames} ({sparsity:.1f}% non-boundary)")
+        print(f"  Transitions (y>{threshold}): {n_boundaries}/{total_frames} ({sparsity:.1f}% non-transition)")
     
-    print("\n" + "="*80)
-    print("✓ All tests passed!")
-    print("="*80)
+    # Test return_features mode
+    with torch.no_grad():
+        y_logits, z_logits, features = model(batch, return_features=True)
+    print(f"\nFeature shapes:")
+    for k, v in features.items():
+        print(f"  {k}: {v.shape}")
+    
+    print("\n" + "=" * 80)
+    print("All tests passed!")
+    print("=" * 80)

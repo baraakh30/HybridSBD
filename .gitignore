@@ -19,3 +19,5 @@ hybrid_detector/
 hybrid_detector - Copy/
 hybrid_detector2/
 hybrid_detector3/
+wandb/
+outputs/

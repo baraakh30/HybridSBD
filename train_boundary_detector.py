@@ -41,7 +41,6 @@ from train_turbo_sbd_v2 import (
 )
 
 # Import new binary architecture and loss
-from detection.turbo_sbd_boundary import create_boundary_model
 from core.binary_boundary_loss import create_binary_boundary_loss
 
 
@@ -52,54 +51,114 @@ class PredecodedDataset(Dataset):
     Loads directly from .pt files created by predecode_dataset.py
     10-20x faster than decoding videos on the fly
     
-    Supports splitting a single train cache into train/val splits
+    Supports:
+    - train/val splits from train directory
+    - test split from test directory
+    - autoshot split from autoshot_cache directory
     """
-    def __init__(self, cache_root, split='train', val_split_ratio=0.15, random_seed=42):
+    def __init__(self, cache_root, split='train', val_split_ratio=0.15, random_seed=42, dataset_type='clipshots', temporal_jitter=False):
         """
         Args:
             cache_root: Path to training_cache directory
-            split: 'train' or 'val'
+            split: 'train', 'val', 'test', or 'autoshot'
             val_split_ratio: Fraction of videos for validation (default 0.15)
             random_seed: Seed for reproducible split (default 42)
+            dataset_type: 'clipshots' or 'autoshot' (determines which cache to use)
         """
         self.cache_root = Path(cache_root)
         self.split = split
+        self.dataset_type = dataset_type
+        self.temporal_jitter = temporal_jitter and (split == 'train')
         
-        # Always load from train directory (has all videos)
-        mapping_file = self.cache_root / 'train' / 'index_mapping.json'
-        if not mapping_file.exists():
-            raise FileNotFoundError(
-                f"Index mapping not found: {mapping_file}\n"
-                f"Please run: python predecode_dataset.py --split train --num_workers 8"
-            )
+        if split == 'autoshot':
+            # Load from autoshot_cache directory (separate dataset)
+            mapping_file = self.cache_root.parent / 'autoshot_cache' / 'index_mapping.json'
+            if not mapping_file.exists():
+                raise FileNotFoundError(
+                    f"AutoShot index mapping not found: {mapping_file}\n"
+                    f"Please run: python predecode_autoshot.py --num_workers 8"
+                )
+            
+            print(f"Loading pre-decoded AutoShot dataset from {mapping_file}...")
+            with open(mapping_file, 'r') as f:
+                data = json.load(f)
+            
+            # Use all AutoShot clips without splitting
+            self.mapping = data['mapping']
+            self.num_videos = len(set(clip['video_name'] for clip in self.mapping))
+            self.num_clips = len(self.mapping)
+            
+            print(f"✓ AUTOSHOT: {self.num_clips} clips from {self.num_videos} videos")
         
-        print(f"Loading pre-decoded dataset from {mapping_file}...")
-        with open(mapping_file, 'r') as f:
-            data = json.load(f)
+        elif split == 'test':
+            # Load from test directory (separate subdirectory)
+            mapping_file = self.cache_root / 'test' / 'index_mapping.json'
+            if not mapping_file.exists():
+                raise FileNotFoundError(
+                    f"Test index mapping not found: {mapping_file}\n"
+                    f"Please run: python predecode_dataset.py --split test --num_workers 8"
+                )
+            
+            print(f"Loading pre-decoded test dataset from {mapping_file}...")
+            with open(mapping_file, 'r') as f:
+                data = json.load(f)
+            
+            # Use all test clips without splitting
+            self.mapping = data['mapping']
+            self.num_videos = len(set(clip['video_name'] for clip in self.mapping))
+            self.num_clips = len(self.mapping)
+            
+            print(f"✓ TEST split: {self.num_clips} clips from {self.num_videos} videos")
         
-        all_mapping = data['mapping']
-        
-        # Get unique videos and create train/val split (MUST match training script logic!)
-        all_videos = sorted(set(clip['video_name'] for clip in all_mapping))
-        num_val = max(1, int(len(all_videos) * val_split_ratio))
-        
-        rng = random.Random(random_seed)
-        rng.shuffle(all_videos)
-        val_videos = set(all_videos[:num_val])
-        train_videos = set(all_videos[num_val:])
-        
-        # Filter clips based on split
-        if split == 'val':
-            self.mapping = [clip for clip in all_mapping if clip['video_name'] in val_videos]
-            self.num_videos = len(val_videos)
-        else:  # train
-            self.mapping = [clip for clip in all_mapping if clip['video_name'] in train_videos]
-            self.num_videos = len(train_videos)
-        
-        self.num_clips = len(self.mapping)
-        
-        print(f"✓ {split.upper()} split: {self.num_clips} clips from {self.num_videos} videos")
-        print(f"  (Total videos: {len(all_videos)}, Train: {len(train_videos)}, Val: {len(val_videos)})")
+        else:
+            # Load from train directory and split into train/val
+            # OR load from standalone cache (like autoshot_cache_train)
+            mapping_file = self.cache_root / 'train' / 'index_mapping.json'
+            
+            # Check if this is a standalone cache (no train/ subdirectory)
+            if not mapping_file.exists():
+                standalone_mapping = self.cache_root / 'index_mapping.json'
+                if standalone_mapping.exists():
+                    # Standalone cache (e.g., autoshot_cache_train)
+                    mapping_file = standalone_mapping
+                    print(f"Loading standalone pre-decoded dataset from {mapping_file}...")
+                else:
+                    raise FileNotFoundError(
+                        f"Index mapping not found in:\n"
+                        f"  {mapping_file}\n"
+                        f"  {standalone_mapping}\n"
+                        f"Please run: python predecode_dataset.py --split train --num_workers 8\n"
+                        f"       or: python predecode_autoshot_train.py --num_workers 8"
+                    )
+            else:
+                print(f"Loading pre-decoded dataset from {mapping_file}...")
+            
+            with open(mapping_file, 'r') as f:
+                data = json.load(f)
+            
+            all_mapping = data['mapping']
+            
+            # Get unique videos and create train/val split (MUST match training script logic!)
+            all_videos = sorted(set(clip['video_name'] for clip in all_mapping))
+            num_val = max(1, int(len(all_videos) * val_split_ratio))
+            
+            rng = random.Random(random_seed)
+            rng.shuffle(all_videos)
+            val_videos = set(all_videos[:num_val])
+            train_videos = set(all_videos[num_val:])
+            
+            # Filter clips based on split
+            if split == 'val':
+                self.mapping = [clip for clip in all_mapping if clip['video_name'] in val_videos]
+                self.num_videos = len(val_videos)
+            else:  # train
+                self.mapping = [clip for clip in all_mapping if clip['video_name'] in train_videos]
+                self.num_videos = len(train_videos)
+            
+            self.num_clips = len(self.mapping)
+            
+            print(f"✓ {split.upper()} split: {self.num_clips} clips from {self.num_videos} videos")
+            print(f"  (Total videos: {len(all_videos)}, Train: {len(train_videos)}, Val: {len(val_videos)})")
     
     def __len__(self):
         return len(self.mapping)
@@ -122,12 +181,24 @@ class PredecodedDataset(Dataset):
         
         # Convert frames from uint8 to float32 and normalize to [0, 1]
         frames = data['frames'].float() / 255.0  # [T, 3, H, W]
-    
+        targets = data['targets']     # [T] long
+        lengths = data['lengths']     # [T] long
+
+        if self.temporal_jitter:
+            # Time-reversal: flip the clip in time with 50% probability.
+            # A cut at frame t becomes a cut at frame T-1-t.
+            # This directly scrambles the position-specific FrameSimilarity and
+            # ColorHistSim matrices the model would otherwise memorize.
+            if torch.rand(1).item() < 0.5:
+                frames  = frames.flip(0)
+                targets = targets.flip(0)
+                lengths = lengths.flip(0)
+
         # All-zero frames are VALID (black frames are legitimate video content)
         return (
-            frames,                      # [T, 3, H, W] float32
-            data['targets'],             # [T] long
-            data['lengths'],             # [T] long
+            frames,   # [T, 3, H, W] float32
+            targets,  # [T] long
+            lengths,  # [T] long
         )
 
 # Configuration
@@ -516,10 +587,7 @@ def main():
     
     # Create model and load pretrained weights
     print("\nInitializing model...")
-    model = create_boundary_model(
-        load_from_checkpoint=CONFIG.get('pretrained_checkpoint'),
-        hidden_dim=256
-    ).to(device)
+    model =None
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     

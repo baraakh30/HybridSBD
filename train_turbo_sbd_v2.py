@@ -30,8 +30,6 @@ except ImportError:
     print("TorchCodec not found, please install it: pip install torchcodec")
     exit(1)
 
-from detection.turbo_sbd import TurboSBD
-from debug_confusion import ConfusionTracker
 
 class LengthAwareFocalLoss(nn.Module):
     """
@@ -697,7 +695,7 @@ def train():
                             prefetch_factor=CONFIG['prefetch_factor'])
     
     # 2. Setup Model
-    model = TurboSBD(num_classes=3).to(device)
+    model = None
     print(f"TurboSBD Params: {sum(p.numel() for p in model.parameters()):,}")
     
     # 3. Loss Function with empirically tuned class weights
@@ -1058,7 +1056,6 @@ def validate(model, loader, device, compute_transition_level=False):
         criterion = nn.CrossEntropyLoss(weight=weights)
     
     # Confusion tracker for detailed analysis
-    confusion = ConfusionTracker()
     
     pbar = tqdm(loader, desc="Validating", leave=False)
     with torch.no_grad():
