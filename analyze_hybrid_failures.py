@@ -541,7 +541,7 @@ def main():
     """Run deep failure analysis from command line"""
     import argparse
     from detection.hybrid_boundary_detector import create_hybrid_detector
-    from train_boundary_detector import PredecodedDataset
+    from datasets import PredecodedDataset
     from torch.utils.data import DataLoader
     
     parser = argparse.ArgumentParser(description='Deep Per-Layer Failure Analysis')

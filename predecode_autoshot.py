@@ -169,6 +169,10 @@ def predecode_video(video_id, video_path, shot_boundaries, output_dir):
         
         print(f"\n  Processing {video_id}: {total_frames} frames, {len(shot_boundaries)} shots")
         
+        # Build full-video shot label array once (O(N)) outside the clip loop.
+        # Re-computing it inside the loop would be O(N × num_clips) for no gain.
+        frame_to_shot = video_id_to_frame_labels(shot_boundaries, total_frames)
+
         # Generate sliding window clips (stride for full coverage)
         clips_metadata = []
         clip_idx = 0
@@ -199,8 +203,7 @@ def predecode_video(video_id, video_path, shot_boundaries, output_dir):
                 padding = frames[-1:].repeat(CONFIG['seq_len'] - frames.shape[0], 1, 1, 1)
                 frames = torch.cat([frames, padding], dim=0)
             
-            # Generate frame-level shot labels for this clip
-            frame_to_shot = video_id_to_frame_labels(shot_boundaries, total_frames)
+            # Slice pre-computed shot label array for this clip window.
             clip_shot_labels = frame_to_shot[start_frame:start_frame + CONFIG['seq_len']]
             
             # Identify transitions in this clip
@@ -311,7 +314,7 @@ def main():
     results = {'success': 0, 'skip': 0, 'error': 0}
     total_clips = 0
     
-    num_workers = max(1, cpu_count() - 12)  # Leave one core free
+    num_workers = max(1, cpu_count() - 1)   # Leave one core free for the OS
     print(f"Using {num_workers} workers for parallel processing...\n")
     
     if num_workers > 1:

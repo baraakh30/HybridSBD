@@ -24,7 +24,7 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
-from train_boundary_detector import PredecodedDataset
+from datasets import PredecodedDataset
 
 
 class TransitionDetailGenerator:

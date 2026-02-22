@@ -249,9 +249,9 @@ def evaluate(model, loader, device, gt_scenes_dict, config):
                 _, _, _, (t, f, n) = evaluate_scenes(gt_sc, pred_sc,
                                                       n_frames_miss_tolerance=config['tolerance'])
                 tp += t; fp += f; fn += n
-            p  = tp / (tp + fp + 1e-8)
-            r  = tp / (tp + fn + 1e-8)
-            f1 = 2 * p * r / (p + r + 1e-8)
+            p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
             all_results[(bt, gt)] = dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn)
             if f1 > best_f1:
                 best_f1, best_bt, best_gt = f1, bt, gt

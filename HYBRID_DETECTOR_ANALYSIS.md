@@ -152,7 +152,7 @@ The boundary head gets **20% extra weight** pushing it to over-predict. With 236
 
 ### Sampling Strategy
 ```python
-# From train_turbo_sbd_v2.py ClipShotsDataset
+# from utils.py ClipShotsDataset
 samples_per_video_train = 20  # 20 clips × 128 frames = 2,560 frames per video
 deterministic = False         # Random sampling with smart focus
 

@@ -17,8 +17,7 @@ Combination rule (mirrors train_hybrid_detector._build_pred_many_hot):
 Usage:
     python test_autoshot.py \\
         --checkpoint outputs/hybrid_detector12/best_model.pt \\
-        --cache_root d:/grad/data/autoshot_cache \\
-        --sweep
+        --cache_root d:/grad/data/autoshot_cache
 """
 
 import os
@@ -39,21 +38,14 @@ from detection.hybrid_boundary_detector import create_hybrid_detector
 
 def collate_autoshot_batch(batch):
     frames       = torch.stack([item['frames']       for item in batch])
-    shot_labels  = torch.stack([item['shot_labels']  for item in batch])
     video_ids    = [item['video_id']    for item in batch]
     start_frames = torch.tensor([item['start_frame'] for item in batch])
     clip_indices = torch.tensor([item['clip_index']  for item in batch])
-    if batch[0]['boundary_labels'] is not None:
-        boundary_labels = torch.stack([item['boundary_labels'] for item in batch])
-    else:
-        boundary_labels = None
     return {
-        'frames':          frames,
-        'shot_labels':     shot_labels,
-        'boundary_labels': boundary_labels,
-        'video_id':        video_ids,
-        'start_frame':     start_frames,
-        'clip_index':      clip_indices,
+        'frames':      frames,
+        'video_id':    video_ids,
+        'start_frame': start_frames,
+        'clip_index':  clip_indices,
     }
 
 
@@ -82,16 +74,14 @@ class AutoShotPredecodedDataset(Dataset):
     def __getitem__(self, idx):
         clip_info = self.mapping[idx]
         clip_data = torch.load(clip_info['clip_file'], weights_only=False)
-        frames          = clip_data['frames'].float() / 255.0
-        shot_labels     = clip_data['shot_labels']
-        boundary_labels = clip_data.get('boundary_labels', None)
+        frames = clip_data['frames'].float() / 255.0
+        # shot_labels and boundary_labels are stored in the cache for completeness
+        # but the evaluation pipeline only needs frames + position metadata.
         return {
-            'frames':          frames,
-            'shot_labels':     shot_labels,
-            'boundary_labels': boundary_labels,
-            'video_id':        clip_info['video_id'],
-            'start_frame':     clip_info['start_frame'],
-            'clip_index':      idx,
+            'frames':      frames,
+            'video_id':    clip_info['video_id'],
+            'start_frame': clip_info['start_frame'],
+            'clip_index':  idx,
         }
 
 
@@ -267,9 +257,9 @@ def evaluate(model, test_loader, device, gt_scenes_dict, config):
                 _, _, _, (t, f, n) = evaluate_scenes(gt_sc, pred_sc,
                                                       n_frames_miss_tolerance=config['tolerance'])
                 tp += t; fp += f; fn += n
-            p  = tp / (tp + fp + 1e-8)
-            r  = tp / (tp + fn + 1e-8)
-            f1 = 2 * p * r / (p + r + 1e-8)
+            p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
             all_results[(bt, gt)] = dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn)
             if f1 > best_f1:
                 best_f1, best_bt, best_gt = f1, bt, gt

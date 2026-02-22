@@ -54,14 +54,14 @@ from detection.hybrid_boundary_detector import create_hybrid_detector
 from core.binary_boundary_loss import create_binary_boundary_loss, create_one_hot_many_hot
 
 # Import existing utilities
-from train_turbo_sbd_v2 import (
+from utils import (
     set_seed, 
     worker_init_fn,
     compute_transition_metrics,
     extract_transitions_from_predictions,
     CONFIG as BASE_CONFIG
 )
-from train_boundary_detector import PredecodedDataset
+from datasets import PredecodedDataset
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +769,7 @@ def main():
         **BASE_CONFIG,  # Inherit all base config
         
         # Model architecture
-        'main_dim': 320,          # Reduced 512→384: 512 has too much capacity for this dataset size
+        'main_dim': 384,          # Reduced 512→384: 512 has too much capacity for this dataset size
         'num_fusion_blocks': 3,
         
         # Resume training
@@ -811,8 +811,8 @@ def main():
         'prefetch_factor': 4,
 
         # Paths
-        'checkpoint_dir': 'outputs/hybrid_detector16',
-        'wandb_project': 'hybrid-boundary-detector10',
+        'checkpoint_dir': 'outputs/hybrid_detector19',
+        'wandb_project': 'hybrid-boundary-detector13',
 
         # Mixed training
         # Real dataset sizes:
@@ -913,7 +913,7 @@ def main():
     else:
         # Fallback to original ClipShotsDataset (slower)
         print("Using on-the-fly video decoding (slower)...")
-        from train_turbo_sbd_v2 import ClipShotsDataset
+        from datasets import ClipShotsDataset
         
         val_json_path = os.path.join(config['input_root'], 'annotations', 'val.json')
         

@@ -53,14 +53,14 @@ from detection.hybrid_boundary_detector import create_hybrid_detector
 from core.binary_boundary_loss import create_binary_boundary_loss
 
 # Import existing utilities
-from train_turbo_sbd_v2 import (
+from utils import (
     set_seed, 
     worker_init_fn,
     compute_transition_metrics,
     extract_transitions_from_predictions,
     CONFIG as BASE_CONFIG
 )
-from train_boundary_detector import PredecodedDataset
+from datasets import PredecodedDataset
 
 
 def train_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, config):
@@ -759,7 +759,7 @@ def main():
     else:
         # Fallback to original ClipShotsDataset (slower)
         print("Using on-the-fly video decoding (slower)...")
-        from train_turbo_sbd_v2 import ClipShotsDataset
+        from datasets import ClipShotsDataset
         
         val_json_path = os.path.join(config['input_root'], 'annotations', 'val.json')
         

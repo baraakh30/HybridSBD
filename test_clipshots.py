@@ -62,9 +62,6 @@ def collate_clipshots_batch(batch):
         'video_id':    video_ids,
         'start_frame': start_frames,
         'clip_index':  clip_indices,
-        # these two are unused by run_inference but kept for API compatibility
-        'shot_labels':     None,
-        'boundary_labels': None,
     }
 
 

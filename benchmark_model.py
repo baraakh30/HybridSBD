@@ -1,328 +1,287 @@
 """
-Benchmark computational efficiency of Hybrid Boundary Detector
+Benchmark Hybrid Boundary Detector — Multi-Model Comparison
 
-Measures:
-1. Inference time (FPS)
-2. GPU memory usage
-3. Model parameters
-4. Throughput (clips/second)
+Measures for each checkpoint:
+  - Parameters
+  - Inference time / FPS at batch sizes [8, 16, 32]
+  - GPU memory (peak)
+  - Real-time speedup factor
+
+Usage:
+    # Default: benchmark all known hybrid_detector checkpoints
+    python benchmark_model.py
+
+    # Specific checkpoints
+    python benchmark_model.py --checkpoints outputs/hybrid_detector13/best_model.pt \
+                                             outputs/hybrid_detector17/best_model.pt
+
+    # CPU only
+    python benchmark_model.py --device cpu
 """
 
-import torch
-import time
 import os
 import sys
-from pathlib import Path
-import numpy as np
-from tqdm import tqdm
+import time
 import json
+import argparse
+from pathlib import Path
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from detection.hybrid_boundary_detector import create_hybrid_detector
 
 
+# ---------------------------------------------------------------------------
+# Default checkpoints
+# ---------------------------------------------------------------------------
+DEFAULT_CHECKPOINTS = [
+    'outputs/hybrid_detector13/best_model.pt',
+    'outputs/hybrid_detector15/best_model.pt',
+    'outputs/hybrid_detector16/best_model.pt',
+    'outputs/hybrid_detector17/best_model.pt',
+    'outputs/hybrid_detector18/best_model.pt',
+    'outputs/hybrid_detector19/best_model.pt',
+]
+
+# Real model input dimensions — must match training / predecoding
+FRAME_H, FRAME_W = 48, 64
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def count_parameters(model):
-    """Count total and trainable parameters"""
-    total = sum(p.numel() for p in model.parameters())
+    total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
 
-def measure_inference_time(model, device, batch_size=32, seq_length=128, num_runs=100, warmup=10):
-    """Measure inference time and FPS"""
+def measure_inference_time(model, device, batch_size, seq_len=128,
+                           num_runs=80, warmup=10):
+    """Returns timing stats (ms) and derived FPS for one batch_size."""
     model.eval()
-    
-    # Create dummy input
-    dummy_input = torch.randn(batch_size, seq_length, 3, 64, 64, device=device)
-    
-    # Warmup
-    print(f"\nWarming up ({warmup} iterations)...")
+    x = torch.randn(batch_size, seq_len, 3, FRAME_H, FRAME_W, device=device)
+
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model(dummy_input)
-    
-    # Benchmark
-    print(f"\nBenchmarking ({num_runs} iterations)...")
+            _ = model(x)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
     times = []
-    
     with torch.no_grad():
-        for _ in tqdm(range(num_runs)):
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            start = time.time()
-            
-            _ = model(dummy_input)
-            
-            torch.cuda.synchronize() if device.type == 'cuda' else None
-            end = time.time()
-            
-            times.append(end - start)
-    
+        for _ in range(num_runs):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = model(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+
     times = np.array(times)
-    
     return {
-        'mean_time': float(times.mean()),
-        'std_time': float(times.std()),
-        'min_time': float(times.min()),
-        'max_time': float(times.max()),
-        'fps': float(batch_size / times.mean()),
-        'frames_per_sec': float(batch_size * seq_length / times.mean())
+        'mean_ms':        float(times.mean() * 1000),
+        'std_ms':         float(times.std()  * 1000),
+        'min_ms':         float(times.min()  * 1000),
+        'max_ms':         float(times.max()  * 1000),
+        'clips_per_sec':  float(batch_size / times.mean()),
+        'frames_per_sec': float(batch_size * seq_len / times.mean()),
     }
 
 
-def measure_memory(model, device, batch_size=32, seq_length=128):
-    """Measure GPU memory usage"""
+def measure_peak_memory_mb(model, device, batch_size, seq_len=128):
+    """Returns peak GPU memory (MB) during a single forward pass."""
     if device.type != 'cuda':
-        return {'memory_mb': 0, 'peak_memory_mb': 0}
-    
+        return None
     model.eval()
-    
-    # Reset memory stats
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.empty_cache()
-    
-    # Measure baseline
-    baseline_memory = torch.cuda.memory_allocated(device) / 1024**2
-    
-    # Run inference
-    dummy_input = torch.randn(batch_size, seq_length, 3, 64, 64, device=device)
-    
+    x = torch.randn(batch_size, seq_len, 3, FRAME_H, FRAME_W, device=device)
     with torch.no_grad():
-        _ = model(dummy_input)
-    
-    # Measure peak
-    peak_memory = torch.cuda.max_memory_allocated(device) / 1024**2
-    current_memory = torch.cuda.memory_allocated(device) / 1024**2
-    
-    return {
-        'baseline_memory_mb': baseline_memory,
-        'current_memory_mb': current_memory,
-        'peak_memory_mb': peak_memory,
-        'inference_memory_mb': peak_memory - baseline_memory
-    }
+        _ = model(x)
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated(device) / 1024 ** 2
 
 
-def benchmark_model(checkpoint_path, device='cuda', batch_sizes=[8, 16, 32], seq_length=128):
-    """Complete benchmark of model"""
-    
-    # Initialize results dictionary
-    results = {
-        'timestamp': datetime.now().isoformat(),
-        'checkpoint': checkpoint_path,
-        'device': str(device),
-        'sequence_length': seq_length,
-        'batch_sizes_tested': batch_sizes
+# ---------------------------------------------------------------------------
+# Per-checkpoint benchmark
+# ---------------------------------------------------------------------------
+
+def benchmark_one(ckpt_path: str, device: torch.device,
+                  batch_sizes: list, seq_len: int) -> dict:
+    """Load one checkpoint, run all measurements, return results dict."""
+    ckpt_path = Path(ckpt_path)
+    label = ckpt_path.parent.name   # e.g. 'hybrid_detector13'
+
+    if not ckpt_path.exists():
+        print(f"  SKIP {ckpt_path} — file not found")
+        return None
+
+    ckpt             = torch.load(ckpt_path, map_location=device, weights_only=False)
+    mcfg             = ckpt.get('config', {})
+    main_dim         = mcfg.get('main_dim', 512)
+    num_fusion_blocks= mcfg.get('num_fusion_blocks', 3)
+    epoch            = ckpt.get('epoch', '?')
+
+    model = create_hybrid_detector(
+        main_dim=main_dim,
+        num_fusion_blocks=num_fusion_blocks,
+    ).to(device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+
+    total_params, _ = count_parameters(model)
+    size_mb = total_params * 4 / 1024 ** 2
+
+    print(f"\n{'─'*72}")
+    print(f"  {label}  |  epoch={epoch}  "
+          f"dim={main_dim}  blocks={num_fusion_blocks}  "
+          f"params={total_params/1e6:.2f}M")
+    print(f"{'─'*72}")
+
+    result = {
+        'label':             label,
+        'checkpoint':        str(ckpt_path),
+        'epoch':             epoch,
+        'main_dim':          main_dim,
+        'num_fusion_blocks': num_fusion_blocks,
+        'total_params':      total_params,
+        'size_fp32_mb':      round(size_mb, 1),
+        'size_fp16_mb':      round(size_mb / 2, 1),
+        'batch_results':     {},
     }
-    
-    print("="*80)
-    print("HYBRID BOUNDARY DETECTOR - COMPUTATIONAL EFFICIENCY BENCHMARK")
-    print("="*80)
-    
-    # Load model
-    print(f"\nLoading model from: {checkpoint_path}")
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    
-    model = create_hybrid_detector(main_dim=256,num_fusion_blocks=3).to(device)
-    
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-    else:
-        print(f"⚠ Checkpoint not found, using random initialization")
-    
-    # 1. Model size
-    print("\n" + "="*80)
-    print("1. MODEL SIZE")
-    print("="*80)
-    
-    total_params, trainable_params = count_parameters(model)
-    model_size_mb = total_params * 4 / 1024**2  # 4 bytes per float32
-    
-    results['model_size'] = {
-        'total_parameters': total_params,
-        'trainable_parameters': trainable_params,
-        'model_size_fp32_mb': model_size_mb,
-        'model_size_fp16_mb': model_size_mb / 2
-    }
-    
-    print(f"Total parameters:      {total_params:,}")
-    print(f"Trainable parameters:  {trainable_params:,}")
-    print(f"Model size (FP32):     {model_size_mb:.2f} MB")
-    print(f"Model size (FP16):     {model_size_mb/2:.2f} MB")
-    
-    # 2. Inference speed for different batch sizes
-    print("\n" + "="*80)
-    print("2. INFERENCE SPEED (different batch sizes)")
-    print("="*80)
-    
-    results['inference_speed'] = {}
-    
+
     for bs in batch_sizes:
-        print(f"\nBatch size: {bs}, Sequence length: {seq_length}")
-        metrics = measure_inference_time(model, device, batch_size=bs, seq_length=seq_length)
-        
-        results['inference_speed'][f'batch_{bs}'] = {
-            'batch_size': bs,
-            'mean_time_ms': float(metrics['mean_time'] * 1000),
-            'std_time_ms': float(metrics['std_time'] * 1000),
-            'min_time_ms': float(metrics['min_time'] * 1000),
-            'max_time_ms': float(metrics['max_time'] * 1000),
-            'throughput_clips_per_sec': float(metrics['fps']),
-            'throughput_frames_per_sec': float(metrics['frames_per_sec']),
-            'latency_per_clip_ms': float(metrics['mean_time'] * 1000),
-            'latency_per_frame_ms': float(metrics['mean_time'] / seq_length * 1000)
+        print(f"    batch_size={bs:>2} ... ", end='', flush=True)
+        timing = measure_inference_time(model, device, bs, seq_len)
+        mem_mb = measure_peak_memory_mb(model, device, bs, seq_len)
+        mem_str = f"{round(mem_mb):4d} MB" if mem_mb is not None else "CPU"
+        print(f"{timing['mean_ms']:7.1f} ms  "
+              f"{timing['clips_per_sec']:6.0f} clips/s  "
+              f"{timing['frames_per_sec']:8.0f} frames/s  {mem_str}")
+
+        result['batch_results'][bs] = {
+            'mean_ms':        timing['mean_ms'],
+            'std_ms':         timing['std_ms'],
+            'min_ms':         timing['min_ms'],
+            'max_ms':         timing['max_ms'],
+            'clips_per_sec':  timing['clips_per_sec'],
+            'frames_per_sec': timing['frames_per_sec'],
+            'peak_memory_mb': mem_mb,
         }
-        
-        print(f"  Mean time:        {metrics['mean_time']*1000:.2f} ms")
-        print(f"  Std time:         {metrics['std_time']*1000:.2f} ms")
-        print(f"  Min time:         {metrics['min_time']*1000:.2f} ms")
-        print(f"  Max time:         {metrics['max_time']*1000:.2f} ms")
-        print(f"  Throughput:       {metrics['fps']:.2f} clips/sec")
-        print(f"  Frame processing: {metrics['frames_per_sec']:.2f} frames/sec")
-        print(f"  Latency/clip:     {metrics['mean_time']*1000:.2f} ms")
-        print(f"  Latency/frame:    {metrics['mean_time']/seq_length*1000:.2f} ms")
-    
-    # 3. Memory usage
+
+    # Real-time speedup factor (at the median batch size, per-clip latency)
+    bs_mid         = batch_sizes[len(batch_sizes) // 2]
+    per_clip_ms    = result['batch_results'][bs_mid]['mean_ms'] / bs_mid
+    clip_dur_ms    = seq_len / 25 * 1000   # 25 fps content
+    speedup        = clip_dur_ms / per_clip_ms
+    result['realtime_speedup_x'] = round(speedup, 1)
+
+    del model
     if device.type == 'cuda':
-        print("\n" + "="*80)
-        print("3. GPU MEMORY USAGE")
-        print("="*80)
-        
-        results['memory_usage'] = {}
-        
-        for bs in batch_sizes:
-            print(f"\nBatch size: {bs}")
-            mem_metrics = measure_memory(model, device, batch_size=bs, seq_length=seq_length)
-            
-            results['memory_usage'][f'batch_{bs}'] = {
-                'batch_size': bs,
-                'baseline_mb': float(mem_metrics['baseline_memory_mb']),
-                'peak_mb': float(mem_metrics['peak_memory_mb']),
-                'inference_mb': float(mem_metrics['inference_memory_mb'])
-            }
-            
-            print(f"  Baseline (model): {mem_metrics['baseline_memory_mb']:.2f} MB")
-            print(f"  Peak:             {mem_metrics['peak_memory_mb']:.2f} MB")
-            print(f"  Inference:        {mem_metrics['inference_memory_mb']:.2f} MB")
-    
-    # 4. Comparison with baselines
-    print("\n" + "="*80)
-    print("4. COMPARISON WITH BASELINES")
-    print("="*80)
-    
-    print(f"\nModel:                            Params       FPS (bs=32)    Memory")
-    print(f"TransNetV2:                       ~7.0M        ~350           ~200 MB")
-    print(f"AutoShot:                         ~12.0M       ~180           ~400 MB")
-    print(f"Ours (Hybrid Detector):           {total_params/1e6:.1f}M")
-    
-    # Re-run with bs=32 for comparison
-    if 32 in batch_sizes:
-        metrics_32 = measure_inference_time(model, device, batch_size=32, seq_length=seq_length, num_runs=50)
-        mem_32 = measure_memory(model, device, batch_size=32, seq_length=seq_length) if device.type == 'cuda' else {'peak_memory_mb': 0}
-        
-        # results['baseline_comparison'] = {
-        #     'ours': {
-        #         'parameters_millions': float(total_params / 1e6),
-        #         'fps_clips_per_sec': float(metrics_32['fps']),
-        #         'fps_frames_per_sec': float(metrics_32['frames_per_sec']),
-        #         'memory_mb': float(mem_32['peak_memory_mb']),
-        #         'latency_ms_per_clip': float(metrics_32['mean_time'] * 1000)
-        #     },
-        #     'transnetv2': {
-        #         'parameters_millions': 7.0,
-        #         'fps_clips_per_sec': 350,
-        #         'memory_mb': 200
-        #     },
-        #     'autoshot': {
-        #         'parameters_millions': 12.0,
-        #         'fps_clips_per_sec': 180,
-        #         'memory_mb': 400
-        #     }
-        # }
-        
-        print(f"  - FPS:            {metrics_32['fps']:.1f} clips/sec")
-        print(f"  - Frame rate:     {metrics_32['frames_per_sec']:.1f} frames/sec")
-        print(f"  - Memory:         {mem_32['peak_memory_mb']:.1f} MB")
-        print(f"  - Latency:        {metrics_32['mean_time']*1000:.2f} ms/clip")
-    
-    # 5. Real-time capability
-    print("\n" + "="*80)
-    print("5. REAL-TIME CAPABILITY")
-    print("="*80)
-    
-    if 32 in batch_sizes:
-        metrics_32 = measure_inference_time(model, device, batch_size=32, seq_length=seq_length, num_runs=50)
-        
-        # Calculate real-time performance
-        batch_size = 32
-        video_fps = 30  # Assumed video frame rate
-        frames_per_clip = seq_length
-        
-        # Method 1: Using throughput (most accurate)
-        frames_per_sec = metrics_32['frames_per_sec']
-        speedup_factor = frames_per_sec / video_fps
-        
-        # Method 2: Using per-clip processing time
-        processing_time_per_clip = metrics_32['mean_time'] / batch_size
-        video_duration_per_clip = frames_per_clip / video_fps
-        speedup_factor_alt = video_duration_per_clip / processing_time_per_clip
-        
-        print(f"\nVideo specifications:")
-        print(f"  Frame rate:           {video_fps} fps")
-        print(f"  Clip duration:        {video_duration_per_clip:.2f} sec ({frames_per_clip} frames)")
-        print(f"\nProcessing performance:")
-        print(f"  Batch processing:     {metrics_32['mean_time']*1000:.2f} ms for {batch_size} clips")
-        print(f"  Per-clip processing:  {processing_time_per_clip*1000:.2f} ms per clip")
-        print(f"  Throughput:           {frames_per_sec:.1f} frames/sec")
-        print(f"\nReal-time capability:")
-        print(f"  Speedup factor:       {speedup_factor:.1f}x real-time")
-        print(f"  (Verification:        {speedup_factor_alt:.1f}x)")
-        
-        if speedup_factor > 1.0:
-            print(f"\n✓ Can process video {speedup_factor:.1f}x FASTER than real-time!")
-            print(f"  → Can process {int(speedup_factor)} videos simultaneously in real-time")
-        else:
-            print(f"\n✗ Cannot process real-time (need {1/speedup_factor:.1f}x speedup)")
-        
-        results['realtime_capability'] = {
-            'video_fps': video_fps,
-            'frames_per_clip': frames_per_clip,
-            'video_duration_per_clip_sec': float(video_duration_per_clip),
-            'batch_processing_time_ms': float(metrics_32['mean_time'] * 1000),
-            'per_clip_processing_time_ms': float(processing_time_per_clip * 1000),
-            'throughput_frames_per_sec': float(frames_per_sec),
-            'speedup_factor': float(speedup_factor),
-            'can_process_realtime': bool(speedup_factor > 1.0),
-            'simultaneous_videos': int(speedup_factor) if speedup_factor > 1.0 else 0
-        }
-    
-    # Save results to JSON
-    output_dir = Path('presentation_materials')
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / 'benchmark_statistics.json'
-    
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print("\n" + "="*80)
-    print("BENCHMARK COMPLETE")
-    print("="*80)
-    print(f"\n✓ Statistics saved to: {output_file}")
+        torch.cuda.empty_cache()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Comparison table
+# ---------------------------------------------------------------------------
+
+def print_comparison_table(all_results: list, batch_sizes: list):
+    bs_summary = batch_sizes[len(batch_sizes) // 2]
+    W = 106
+    print(f"\n{'='*W}")
+    print(f"  COMPARISON TABLE  —  batch_size={bs_summary}, seq_len=128, "
+          f"frame={FRAME_H}×{FRAME_W}, device={all_results[0].get('device','?')}")
+    print('='*W)
+    hdr = (f"  {'Model':<22} {'Dim':>4} {'Blk':>3}  {'Params':>7}  "
+           f"{'FP32 MB':>7}  {'FP16 MB':>7}  "
+           f"{'Latency ms':>10}  {'Clips/s':>7}  "
+           f"{'Kframes/s':>9}  {'Mem MB':>7}  {'RT speedup':>10}")
+    print(hdr)
+    print('─'*W)
+    for r in all_results:
+        br  = r['batch_results'].get(bs_summary, {})
+        mem = br.get('peak_memory_mb')
+        print(
+            f"  {r['label']:<22} {r['main_dim']:>4} {r['num_fusion_blocks']:>3}  "
+            f"{r['total_params']/1e6:>6.2f}M  "
+            f"{r['size_fp32_mb']:>7.1f}  {r['size_fp16_mb']:>7.1f}  "
+            f"{br.get('mean_ms', 0):>10.1f}  "
+            f"{br.get('clips_per_sec', 0):>7.0f}  "
+            f"{br.get('frames_per_sec', 0)/1000:>9.1f}  "
+            f"{(str(round(mem)) if mem is not None else 'CPU'):>7}  "
+            f"{r.get('realtime_speedup_x', 0):>9.1f}x"
+        )
+    print('='*W)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Benchmark multiple Hybrid Boundary Detector checkpoints')
+    parser.add_argument('--checkpoints', nargs='+',
+                        default=DEFAULT_CHECKPOINTS,
+                        help='One or more checkpoint paths to benchmark')
+    parser.add_argument('--device',      type=str, default='cuda')
+    parser.add_argument('--batch_sizes', type=int, nargs='+',
+                        default=[8, 16, 32])
+    parser.add_argument('--seq_len',     type=int, default=128)
+    parser.add_argument('--output',      type=str,
+                        default='outputs/benchmark_results.json')
+    args = parser.parse_args()
+
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    print(f"\n{'='*72}")
+    print(f"  HYBRID BOUNDARY DETECTOR — MULTI-MODEL BENCHMARK")
+    print(f"{'='*72}")
+    print(f"  Device      : {device}")
+    print(f"  Batch sizes : {args.batch_sizes}")
+    print(f"  Seq len     : {args.seq_len}")
+    print(f"  Frame size  : {FRAME_H}x{FRAME_W}")
+    print(f"  Models      : {len(args.checkpoints)}")
+    if device.type == 'cuda':
+        props = torch.cuda.get_device_properties(device)
+        print(f"  GPU         : {props.name}  "
+              f"({props.total_memory/1024**3:.1f} GB)")
+
+    all_results = []
+    for ckpt_path in args.checkpoints:
+        r = benchmark_one(ckpt_path, device, args.batch_sizes, args.seq_len)
+        if r is not None:
+            r['device'] = str(device)
+            all_results.append(r)
+
+    if not all_results:
+        print("\nNo checkpoints found — nothing to report.")
+        return
+
+    print_comparison_table(all_results, args.batch_sizes)
+
+    # Save JSON
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, 'w') as f:
+        json.dump({
+            'timestamp':   datetime.now().isoformat(),
+            'device':      str(device),
+            'batch_sizes': args.batch_sizes,
+            'seq_len':     args.seq_len,
+            'frame_size':  [FRAME_H, FRAME_W],
+            'models':      all_results,
+        }, f, indent=2)
+    print(f"\n  Results saved -> {args.output}\n")
 
 
 if __name__ == '__main__':
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Benchmark Hybrid Boundary Detector')
-    parser.add_argument('--checkpoint', type=str, default='outputs/hybrid_detector4/best_model.pt',
-                        help='Path to model checkpoint')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to run on (cuda/cpu)')
-    parser.add_argument('--batch_sizes', type=int, nargs='+', default=[8, 16, 32],
-                        help='Batch sizes to test')
-    
-    args = parser.parse_args()
-    
-    benchmark_model(args.checkpoint, args.device, args.batch_sizes)
+    main()

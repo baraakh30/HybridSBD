@@ -1,326 +1,145 @@
-# Video Shot Detection System
+# Video Shot Boundary Detection
 
-A comprehensive multimodal video shot boundary detection system that integrates multiple feature representations through sophisticated fusion strategies to achieve robust and accurate shot boundary detection.
+A dual-head deep learning system for detecting shot boundaries in video — handling both **hard cuts** and **gradual transitions** (dissolves, fades). Trained on AutoShot + ClipShots; evaluated zero-shot on BBC Planet Earth.
 
-## System Overview
+## Results
 
-The system follows a modular design that can be deployed in both statistical and deep learning modes, featuring:
+All models trained exclusively on SHOT + ClipShots. **Bold** = best per column.
 
-- **4 Feature Extractors**: HSV histograms, CNN features (ResNet-50), CLIP embeddings, and optical flow
-- **5 Fusion Strategies**: Concatenation, weighted sum, PCA, cross-transformer, and hierarchical fusion
-- **2 Detection Methods**: Statistical (dynamic thresholding) and transformer-based approaches
-- **Comprehensive Evaluation**: Framework for comparing strategies across multiple datasets
+| Model | Params | SHOT F1 | ClipShots F1 | BBC zero-shot F1 |
+|---|---|---|---|---|
+| AutoShot (paper) | ~7M | 0.841 | 0.787 | — |
+| Ours dim=256, 3-block | 5.8M | 0.9160 | 0.7804 | 0.9563 |
+| Ours dim=512, 3-block | 14.1M | 0.9103 | 0.7844 | 0.9654 |
+| Ours dim=256, 4-block | 6.5M | 0.9201 | 0.7916 | 0.9669 |
+| **Ours dim=384, 4-block** | **10.9M** | **0.9238** | **0.7934** | **0.9706** |
+| Ours dim=512, 4-block | 17.1M | 0.9066 | 0.7729 | 0.9651 |
+
+See [RESULTS.md](RESULTS.md) for full methodology, threshold sweeps, and per-video breakdowns.
+
+---
 
 ## Architecture
 
+`HybridBoundaryDetector` — dual-head design following AutoShot's evaluation paradigm:
+
+- **Head y (one_hot):** Predicts the midpoint frame of each transition (primary loss weight 5.0).
+- **Head z (many_hot):** Predicts every frame inside gradual transitions (auxiliary loss weight 0.3).
+
+**Inference:**
 ```
-Video Input → Feature Extraction → Fusion → Detection → Results
-    ↓              ↓                ↓         ↓         ↓
-Frame         HSV, CNN,      Concatenation,  Statistical,  Boundaries,
-Extraction    CLIP, Flow     Weighted, PCA,  Transformer   Segments,
-                            Transformer,                   Keyframes
-                            Hierarchical
+pred_is_boundary = sigmoid(y) > boundary_threshold
+pred_is_gradual  = sigmoid(z) > gradual_threshold
+pred_many_hot    = pred_is_gradual | (pred_is_boundary & ~pred_is_gradual)
 ```
+
+### Feature streams (main_dim=512)
+
+| Stream | Extractor | Output dim |
+|---|---|---|
+| RGB spatial | EfficientSpatialEncoder (3D stem ±7fr) | 640 → main_dim/2 |
+| Diff spatial | EfficientSpatialEncoder (3D stem on multi-dist diffs) | 640 → main_dim/2 |
+| Feature delta | 2D per-frame, distances [1,2,4,8] | 640×4 → main_dim/2 |
+| Frame similarity | FrameSimilarity ×3 window scales | 192 → main_dim/4 |
+| Color hist similarity | ColorHistogramSimilarity | 128 → main_dim/4 |
+| Pixel motion | PixelMotionExtractor (5 distances) | 15 (raw) |
+
+Fused features pass through N × `ProgressiveFusionBlock` (MultiScaleDilatedConv with dilations 1,4,16,64 + LightweightTemporalAttention with learned positional encoding + gated residual).
+
+---
 
 ## Installation
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd video_shot_detection
-```
-
-2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Install additional dependencies:
+Requires Python 3.10+, PyTorch 2.x, and `torchcodec` for video decoding.
+
+---
+
+## Workflow
+
+### 1. Pre-decode training data
+
 ```bash
-# For CLIP (if not installed via requirements)
-pip install git+https://github.com/openai/CLIP.git
+# AutoShot training clips (jitter + random fill, 70 clips/video)
+python predecode_autoshot_train.py
 
+# ClipShots training clips (transition-focused sampling)
+python predecode_dataset.py
+
+# BBC Planet Earth (sliding window, for fine-tuning / zero-shot eval)
+python predecode_bbc.py
 ```
 
-## Quick Start
+### 2. Train
 
-### Basic Usage
+```bash
+# Train from scratch
+python train_hybrid_detector.py
 
-```python
-from core.config import DEFAULT_RESEARCH_CONFIG
-from core.coordinator import ProcessingCoordinator
+# Resume from checkpoint
+python train_hybrid_detector.py --resume outputs/hybrid_detector/best_model.pt
 
-# Initialize with default configuration
-config = DEFAULT_RESEARCH_CONFIG
-coordinator = ProcessingCoordinator(config)
-coordinator.initialize()
-
-# Process a video
-results = coordinator.process_video("path/to/video.mp4")
-
-# Get detected boundaries
-boundaries = results["detection_results"]["statistical"]
-print(f"Detected {len(boundaries)} shot boundaries")
+# Key options
+python train_hybrid_detector.py --main_dim 384 --num_fusion_blocks 4 --epochs 80
 ```
 
-### Custom Configuration
+### 3. Evaluate
 
-```python
-from core.config import VideoShotConfig
+```bash
+# AutoShot test set (SHOT benchmark)
+python predecode_autoshot.py  # pre-decode test clips first
+python test_autoshot.py --checkpoint outputs/hybrid_detector/best_model.pt
 
-# Create custom configuration
-config = VideoShotConfig()
+# BBC Planet Earth (zero-shot)
+python test_bbc.py --checkpoint outputs/hybrid_detector/best_model.pt
 
-# Configure features
-config.features.hsv_enabled = True
-config.features.cnn_enabled = True
-config.features.clip_enabled = False
-config.features.optical_flow_enabled = True
-
-# Configure fusion strategy
-config.fusion.strategy = "hierarchical"
-
-# Configure detection
-config.detection.method = "both"  # Use both statistical and transformer
-
-# Initialize and process
-coordinator = ProcessingCoordinator(config)
-coordinator.initialize()
-results = coordinator.process_video("video.mp4")
+# ClipShots
+python test_bbc.py --checkpoint outputs/hybrid_detector/best_model.pt  # analogous
 ```
 
-## Feature Extractors
+### 4. Fine-tune on BBC
 
-### 1. HSV Histogram Features (768-dim)
-- Converts RGB frames to HSV color space
-- Computes histograms for H, S, V channels (256 bins each)
-- Applies Gaussian smoothing and normalization
-
-### 2. CNN Features (2048-dim)
-- Uses pretrained ResNet-50 model
-- Extracts features from penultimate layer
-- Applies L2 normalization
-
-### 3. CLIP Embeddings (512-dim)
-- Uses OpenAI's CLIP vision encoder
-- Provides semantic representation
-- Multiple model variants supported
-
-### 4. Optical Flow Features (40-dim)
-- Computes dense optical flow between frames
-- Extracts Histogram of Optical Flow (HOF)
-- 8 direction bins × 5 magnitude bins
-
-## Fusion Strategies
-
-### 1. Concatenation-Based Fusion
-Simple baseline that concatenates all features and computes Euclidean distance.
-
-### 2. Weighted Sum of Individual Distances
-Computes individual distances per feature type and combines using optimized weights via genetic algorithm.
-
-### 3. PCA-Based Dimensionality Reduction
-Applies PCA to concatenated features, retaining 95-99% variance for denoising and efficiency.
-
-### 4. Cross-Transformer Fusion
-Uses cross-modal attention to learn adaptive fusion weights based on context.
-
-### 5. Hierarchical Fusion (3-Level)
-- **Level 1**: HSV + Optical Flow → 256-dim (1D convolution)
-- **Level 2**: CNN + Level1 → 512-dim (cross-attention)
-- **Level 3**: CLIP + Level2 → 512-dim (gated fusion)
-
-## Detection Methods
-
-### Statistical Detection
-- Dynamic thresholding with multi-scale analysis
-- Adaptive window management
-- Peak detection with prominence scoring
-- Content-aware filtering
-
-### Transformer Detection
-- 6-layer transformer encoder
-- Positional encoding for temporal relationships
-- Binary boundary classification
-- Sequence-level training with balanced sampling
-
-## Evaluation Framework
-
-Comprehensive evaluation system for comparing fusion strategies:
-
-```python
-from evaluation.evaluator import ShotDetectionEvaluator
-
-# Setup evaluation
-evaluator = ShotDetectionEvaluator(config)
-
-# Define datasets and ground truth
-video_datasets = {
-    "dataset1": ["video1.mp4", "video2.mp4"],
-    "dataset2": ["video3.mp4", "video4.mp4"]
-}
-
-ground_truth = {
-    "video1.mp4": [100, 250, 400],  # Boundary frame indices
-    "video2.mp4": [150, 300, 450]
-}
-
-# Run evaluation
-results = evaluator.evaluate_fusion_strategies(
-    video_datasets, ground_truth
-)
-
-# Generate report
-evaluator.generate_evaluation_report(results, "evaluation_report.md")
+```bash
+python finetune_bbc.py --checkpoint outputs/hybrid_detector/best_model.pt
 ```
 
-## Configuration Options
+---
 
-### Feature Configuration
-```python
-config.features.hsv_enabled = True
-config.features.hsv_bins = 256
-config.features.cnn_model = "resnet50"
-config.features.clip_model = "ViT-B/32"
-config.features.optical_flow_method = "farneback"
+## Project Structure
+
+```
+detection/
+  hybrid_boundary_detector.py   # Model definition: HybridBoundaryDetector
+core/
+  binary_boundary_loss.py       # Focal BCE dual-head loss
+  context_aware_loss.py
+data/
+  autoshot_cache/               # Pre-decoded AutoShot test clips
+  autoshot_cache_train/         # Pre-decoded AutoShot training clips
+  bbc_cache/                    # Pre-decoded BBC clips
+  training_cache/               # Pre-decoded ClipShots clips
+
+predecode_autoshot_train.py     # Pre-decode AutoShot train set
+predecode_autoshot.py           # Pre-decode AutoShot test set
+predecode_dataset.py            # Pre-decode ClipShots
+predecode_bbc.py                # Pre-decode BBC Planet Earth
+train_hybrid_detector.py        # Main training script
+finetune_bbc.py                 # BBC fine-tuning script
+test_autoshot.py                # Evaluate on SHOT benchmark
+test_bbc.py                     # Evaluate on BBC Planet Earth
+RESULTS.md                      # Full results and methodology
 ```
 
-### Fusion Configuration
-```python
-config.fusion.strategy = "hierarchical"
-config.fusion.pca_variance_retained = 0.95
-config.fusion.transformer_heads = 4
-config.fusion.weights_optimization = "genetic"
-```
-
-### Detection Configuration
-```python
-config.detection.method = "both"
-config.detection.threshold_method = "adaptive"
-config.detection.smoothing_method = "gaussian"
-config.detection.transformer_layers = 6
-```
-
-## Performance Optimization
-
-### For Real-time Processing
-```python
-# Use lightweight configuration
-config = DEFAULT_EDGE_CONFIG
-config.features.clip_enabled = False
-config.fusion.strategy = "concatenation"
-config.detection.method = "statistical"
-```
-
-### For High Accuracy
-```python
-# Use full research configuration
-config = DEFAULT_RESEARCH_CONFIG
-config.fusion.strategy = "hierarchical"
-config.detection.method = "both"
-```
-
-## Output Formats
-
-### JSON Results
-```json
-{
-  "video_path": "video.mp4",
-  "detection_results": {
-    "statistical": [45, 120, 200],
-    "transformer": [47, 118, 202],
-    "combined": [46, 119, 201]
-  },
-  "fusion_strategy": "hierarchical",
-  "processing_time": 15.2,
-  "performance_stats": {
-    "frames_per_second": 12.5,
-    "memory_usage": {"total": 2048}
-  }
-}
-```
-
-### Video Segments
-The system can automatically extract:
-- Shot segments as separate video files
-- Keyframes at boundary locations
-- Temporal annotations
-
-## Deployment Options
-
-### Research Environment
-- Full feature set with all extractors
-- Both detection methods enabled
-- Comprehensive evaluation capabilities
-
-### Production Environment
-- Optimized feature extraction
-- Statistical detection for real-time performance
-- Configurable quality/speed trade-offs
-
-### Edge Deployment
-- Lightweight features (HSV + Optical Flow)
-- Statistical detection only
-- Memory-optimized processing
-
-## Datasets Supported
-
-The evaluation framework supports multiple datasets:
-- **ClipShots**: Modern online content
-- **TRECVID**: Broadcast content
-- **MSU**: Mixed content types
-- **RAI**: Documentary footage
-- **BBC Planet Earth**: Nature content
-- **Custom datasets**: With JSON ground truth
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Implement your changes
-4. Add tests and documentation
-5. Submit a pull request
+---
 
 ## Citation
 
-If you use this system in your research, please cite:
-
 ```bibtex
-@misc{video_shot_detection_2024,
-  title={Multimodal Video Shot Detection System},
-  author={Graduate Research Team},
-  year={2024},
-  howpublished={\\url{https://github.com/your-repo/video-shot-detection}}
+@misc{hybrid_sbd_2026,
+  title  = {Dual-Head Hybrid Shot Boundary Detector},
+  year   = {2026}
 }
 ```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- OpenAI CLIP for semantic embeddings
-- PyTorch team for the deep learning framework
-- Research communities for dataset contributions
-
-train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"
-
-
-C:/Users/Baraa/anaconda3/envs/unsloth_env/python.exe d:/grad/video_shot_detection/main_test.py --video_path "C:\Users\Baraa\Documents\ClipShots\videos\train\3505586409.mp4" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --method statistical --tolerance 10
-
-train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --train_all_strategies
-
-train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features"  --max_workers 10 --parallel_features
-
-train_transformer.py --video_dir "C:\Users\Baraa\Documents\ClipShots\videos\train" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --extract_features --features_dir "training_features" --disable_logging --max_workers 10 --parallel_features
-
-
-
-
-python interactive_visualizer.py --video "C:\Users\Baraa\Documents\ClipShots\videos\train\4001498009.mp4" --results "test_results_single\test_results.json" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json"
-
-
-
-
-"C:/Users/Abdalrahman Khanfar/Documents/grad/.venv/Scripts/python.exe" test_sequence_model.py --model_path "C:\Users\Baraa\Documents\grad\models\111.pth" --features_dir "training_features" --ground_truth "C:\Users\Baraa\Documents\ClipShots\annotations\train.json" --output_dir "test_results_single" --num_videos 300 --visualize --sequence_threshold 0.6 --boundary_selection max_diff

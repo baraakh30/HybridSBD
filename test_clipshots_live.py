@@ -221,9 +221,9 @@ def sweep_and_score(video_y, video_z, gt_scenes_dict, tolerance, min_scene_len=1
                 pred_sc = merge_short_scenes(pred_sc, min_scene_len)
             _, _, _, (t, f, n) = evaluate_scenes(gt_scenes_dict[vid], pred_sc, tolerance)
             tp += t; fp += f; fn += n
-        p  = tp / (tp + fp + 1e-8)
-        r  = tp / (tp + fn + 1e-8)
-        f1 = 2 * p * r / (p + r + 1e-8)
+        p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
         return dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn)
 
     print(f"\nCoarse sweep {len(coarse)} x {len(gradual_thresholds)} "

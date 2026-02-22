@@ -46,8 +46,8 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
-from train_boundary_detector import PredecodedDataset
-from train_turbo_sbd_v2 import extract_transitions_from_predictions, compute_transition_metrics
+from datasets import PredecodedDataset
+from utils import extract_transitions_from_predictions, compute_transition_metrics
 from analyze_hybrid_failures import extract_failure_cases, analyze_per_layer_statistics, compare_failure_modes, print_analysis_summary
 
 
