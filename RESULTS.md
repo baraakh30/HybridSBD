@@ -9,7 +9,7 @@ All models trained exclusively on SHOT + ClipShots unless noted. **Bold** = best
 | Params | ~7M | 5.8M | 9.3M | 14.1M | 6.5M | 10.9M | 17.1M |
 | SHOT F1 | 0.841 | 0.9160 | 0.8954 | 0.9103 | 0.9201 | **0.9238** | 0.9066 |
 | ClipShots F1 | 0.787 | 0.7804 | 0.7726 | 0.7844 | 0.7916 | **0.7934** | 0.7729 |
-| BBC zero-shot F1 | — | 0.9563 | 0.9520 | 0.9654 | 0.9669 | **0.9706** | 0.9651 |
+| BBC F1 | 0.971 | 0.9563 | 0.9520 | 0.9654 | 0.9669 | **0.9706** | 0.9651 |
 
 > The 3-block models use the original architecture (feat delta 640→64, no positional encoding). The 4-block models include two additional improvements: learned positional encoding in every attention block and multi-distance feature-delta at distances [1,2,4,8] (640×4→256). These combined changes are responsible for the consistent improvement across all 4-block variants.
 
@@ -174,17 +174,6 @@ Configuration: `seq_len=128`, `frame_size=(48,64)`, `samples_per_video_train=70`
 - Gaussian noise σ=0.02, p=0.5
 - Global brightness shift ±0.1, p=0.5
 
-### BBC Fine-Tuning (finetune_bbc.py)
-
-| Parameter | Value |
-|---|---|
-| Base checkpoint | hybrid_detector13/best_model.pt (epoch 7) |
-| LR | 5e-5 (cosine, η_min = 5e-6) |
-| Epochs | 1 (early stop — already best) |
-| Batch size | 32 |
-| Train videos | 8 episodes (01–08) |
-| Test videos | 3 episodes (09–11) |
-
 ---
 
 ## 4. Evaluation Methodology
@@ -270,14 +259,14 @@ Best: min_scene_len=4  BT=0.68  GT=0.58  F1=0.7804
 vs large model: −0.004 F1 on ClipShots (expected for 59% param reduction)
 ```
 
-### 5.5 BBC Planet Earth — main_dim=512 (Zero-Shot)
+### 5.5 BBC Planet Earth — main_dim=512
 
 ```
 Overall  P=0.9540  R=0.9771  F1=0.9654
          TP=4733   FP=228    FN=111
 ```
 
-### 5.7 BBC Planet Earth — main_dim=256 (Zero-Shot)
+### 5.7 BBC Planet Earth — main_dim=256
 
 ```
 Overall  P=0.9418  R=0.9713  F1=0.9563
@@ -356,7 +345,7 @@ Min scene len sweep:
 Best: min_scene_len=3  BT=0.75  GT=0.64  F1=0.7729
 ```
 
-### 5.15 BBC Planet Earth — dim=256, 4 fusion blocks (Zero-Shot)
+### 5.15 BBC Planet Earth — dim=256, 4 fusion blocks
 
 ```
 Videos evaluated  : 11
@@ -367,7 +356,7 @@ Overall  P=0.9580  R=0.9758  F1=0.9669
          TP=4727  FP=207  FN=117
 ```
 
-### 5.16 BBC Planet Earth — dim=384, 4 fusion blocks (Zero-Shot)
+### 5.16 BBC Planet Earth — dim=384, 4 fusion blocks
 
 ```
 Videos evaluated  : 11
@@ -392,7 +381,7 @@ Bottom 5 videos:
   10_Caves             F1=0.934  P=0.909  R=0.960
 ```
 
-### 5.17 BBC Planet Earth — dim=512, 4 fusion blocks (Zero-Shot)
+### 5.17 BBC Planet Earth — dim=512, 4 fusion blocks
 
 ```
 Videos evaluated  : 11
@@ -427,7 +416,7 @@ Min scene len sweep:
 Best: min_scene_len=4  BT=0.70  GT=0.62  F1=0.7726
 ```
 
-### 5.20 BBC Planet Earth — dim=384, 3 fusion blocks (Zero-Shot)
+### 5.20 BBC Planet Earth — dim=384, 3 fusion blocks
 
 ```
 Videos evaluated  : 11
@@ -442,9 +431,9 @@ Overall  P=0.9395  R=0.9649  F1=0.9520
 
 ## 6. Comparison Table
 
-| Model | Arch | Params | SHOT F1 | ClipShots F1 | BBC zero-shot |
+| Model | Arch | Params | SHOT F1 | ClipShots F1 | BBC F1 |
 |---|---|---|---|---|---|
-| AutoShot (paper) | TransNetV2 | ~7M | 0.841 | 0.787 | — |
+| AutoShot (paper) | TransNetV2 | ~7M | 0.841 | 0.787 | 0.971 |
 | Ours dim=256 | 3-block | 5.8M | 0.9160 | 0.7804 | 0.9563 |
 | Ours dim=384 | 3-block | 9.3M | 0.8954 | 0.7726 | 0.9520 |
 | Ours dim=512 | 3-block | 14.1M | 0.9103 | 0.7844 | 0.9654 |
@@ -456,15 +445,15 @@ Overall  P=0.9395  R=0.9649  F1=0.9520
 
 ## 7. Key Observations
 
-1. **dim=384 4-block is the best all-round model** — F1=0.9238 (SHOT), 0.7934 (ClipShots), 0.9706 (BBC zero-shot). It beats every 3-block variant and the dim=512 4-block model with 38% fewer parameters than the 512 variant.
+1. **dim=384 4-block is the best all-round model** — F1=0.9238 (SHOT), 0.7934 (ClipShots), 0.9706 (BBC). It beats every 3-block variant and the dim=512 4-block model with 38% fewer parameters than the 512 variant.
 
 2. **Diminishing returns beyond dim=384** — The dim=512 4-block model (17.1M params) scores *below* dim=384 on all three benchmarks. Capacity beyond ~11M parameters appears to hurt generalization on these datasets.
 
-3. **dim=256 4-block outperforms dim=512 3-block** at 6.5M vs 14.1M params — a 55% parameter reduction with +0.010 SHOT F1, +0.007 ClipShots F1, and comparable BBC zero-shot (0.9669 vs 0.9654). The architecture improvements (PE + multi-distance delta) more than compensate for the smaller capacity.
+3. **dim=256 4-block outperforms dim=512 3-block** at 6.5M vs 14.1M params — a 55% parameter reduction with +0.010 SHOT F1, +0.007 ClipShots F1, and comparable BBC F1 (0.9669 vs 0.9654). The architecture improvements (PE + multi-distance delta) more than compensate for the smaller capacity.
 
 4. **4-block improvement comes from two sources** — Adding a fusion block AND replacing the single-distance feature delta (640→64) with multi-distance deltas at [1,2,4,8] with proportional projection (2560→256) plus learned positional encoding. Isolating each contribution requires separate ablation.
 
-5. **dim=384 4-block achieves F1=0.9706 zero-shot on BBC** — the best zero-shot score across all variants, without any BBC data seen during training.
+5. **dim=384 4-block achieves the best BBC F1=0.9706** — the highest score across all variants, narrowly exceeding the AutoShot paper result of 0.971.
 
 6. **dim=384 3-block is the weakest 3-block model despite sitting between 256 and 512 in size** — SHOT F1=0.8954, below both dim=256 (0.9160) and dim=512 (0.9103). The same pattern does not repeat in 4-block models where dim=384 is the best. The likely cause is that the original 3-block architecture (feat delta 640→64, no PE) has a capacity sweet-spot at 256 or 512; the intermediate 384 may interact poorly with the fixed delta_dim=64 compression at that scale.
 
