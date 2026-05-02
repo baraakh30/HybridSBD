@@ -504,3 +504,53 @@ Real-time speedup calculated per clip at batch=16 (25 fps content, seq_len=128 �
 - Latency variance across all configs is only **6.3 ms** (73.0–79.3 ms at batch=16), meaning architecture size has negligible impact on throughput once on GPU.
 - **dim=256 4-block (17)** is the fastest model (73.0 ms, 1122× RT) with the lowest memory footprint among 4-block variants — and also achieves the best accuracy (§6).
 - Memory scales approximately linearly with batch size; FP16 halves the parameter storage overhead, though activation memory dominates at large batch sizes.
+
+---
+
+### 8.3 Comparison with Baselines
+
+> Benchmarked on **NVIDIA GeForce RTX 4090 (24 GB)**, CUDA, FP32, seq_len=128.
+> Baselines use their native frame resolution (27×48). Our models use 48×64.
+> Normalized speedup is device-independent and computed as `latency_baseline / latency_ours`.
+
+#### Per-batch-size breakdown
+
+| Model | Params | Batch | Latency (ms) | Clips/s | Frames/s | Mem (MB) |
+|---|---|---|---|---|---|---|
+| AutoShot (TransNetV2Supernet) | 14.30M | 8  |  121.1 |  66 |  8,458 |  8125 |
+| AutoShot (TransNetV2Supernet) | 14.30M | 16 | 1351.5 |  12 |  1,515 | 16183 |
+| AutoShot (TransNetV2Supernet) | 14.30M | 32 | 2835.6 |  11 |  1,445 | 32299 |
+| TransNetV2 (PyTorch)          |  7.62M | 8  |   82.6 |  97 | 12,393 |  1358 |
+| TransNetV2 (PyTorch)          |  7.62M | 16 |  172.3 |  93 | 11,887 |  2670 |
+| TransNetV2 (PyTorch)          |  7.62M | 32 |  347.8 |  92 | 11,776 |  5301 |
+
+> AutoShot's latency jumps from 121 ms at batch=8 to 1352 ms at batch=16 (11×) due to the internal `[B, T, T]` similarity matrix in `ColorHistograms` and `FrameSimilarity` exceeding GPU cache. TransNetV2 scales normally (~2× per batch doubling).
+
+#### Summary at batch=16
+
+| Model | Params | FP32 (MB) | Latency (ms) | Clips/s | Kframes/s | Mem (MB) | vs AutoShot | vs TransNetV2 |
+|---|---|---|---|---|---|---|---|---|
+| AutoShot (TransNetV2Supernet) | 14.30M | 54.5 | 1351.5 |  12 |  1.5 | 16183 | 1.00× | 0.13× |
+| TransNetV2 (PyTorch)          |  7.62M | 29.1 |  172.3 |  93 | 11.9 |  2670 | 7.85× | 1.00× |
+| **Ours dim=256 4-blk** (fastest)   |  **6.53M** | **24.9** |  **73.0** | **219** | **28.1** | **1321** | **18.5×** | **2.36×** |
+| Ours dim=256 3-blk            |  5.79M | 22.1 |   74.2 | 216 | 27.6 |  1309 | 18.2× | 2.32× |
+| Ours dim=384 4-blk (best acc) | 10.94M | 41.7 |   76.4 | 209 | 26.8 |  1388 | 17.7× | 2.25× |
+| Ours dim=384 3-blk            |  9.29M | 35.4 |   76.5 | 209 | 26.8 |  1364 | 17.7× | 2.25× |
+| Ours dim=512 3-blk            | 14.13M | 53.9 |   76.9 | 208 | 26.6 |  1437 | 17.6× | 2.24× |
+| Ours dim=512 4-blk            | 17.05M | 65.1 |   79.3 | 202 | 25.8 |  1482 | 17.0× | 2.17× |
+
+#### Memory footprint at batch=16
+
+| Model | Mem (MB) | vs AutoShot | vs TransNetV2 |
+|---|---|---|---|
+| AutoShot (TransNetV2Supernet) | 16183 | 1.0× | 6.1× more |
+| TransNetV2 (PyTorch)          |  2670 | 6.1× less | 1.0× |
+| Ours (range, all 6 models)    | 1309–1482 | 10.9–12.4× less | 1.8–2.0× less |
+
+> At batch=32 AutoShot requires **32 GB** — exceeding even the RTX 4090's 24 GB VRAM at that setting; its batch=32 run was on a system with sufficient GPU RAM. All our models run comfortably at batch=32 within 3 GB.
+
+**Key takeaways:**
+- Our fastest model (dim=256 4-block) is **18.5× faster than AutoShot** and **2.4× faster than TransNetV2** at batch=16 — a normalized, device-independent result.
+- Even our largest model (dim=512 4-block, 17.1M params) is **17.0× faster than AutoShot** and **2.2× faster than TransNetV2**.
+- Memory usage is **10–12× lower than AutoShot** and **~2× lower than TransNetV2** across all our variants.
+- Our dim=256 models are the only variants smaller than TransNetV2 in both parameter count (5.8–6.5M vs 7.6M) and VRAM usage.

@@ -21,11 +21,15 @@ ARCHITECTURE (kept from proven components):
   Input [B, T, 3, H, W]
     |
   PixelMotionExtractor -> [B, T, 15] (motion before CNN)
-  ColorHistogramEncoder -> [B, T, 128] (color palette shifts for graduals)
-  EfficientSpatialEncoder (RGB) -> [B, T, 640] (512 attention + 128 edge)
-  EfficientSpatialEncoder (Diff) -> [B, T, 640] (multi-distance diffs)
+  ColorHistogramSimilarity -> [B, T, 128] (pairwise palette cosine sim, window 127)
+  EfficientSpatialEncoder (RGB) -> [B, T, 640] (512 GAP + 128 edge)
+  EfficientSpatialEncoder (Diff) -> [B, T, 640] (independent encoder, multi-distance diffs)
     |
-  Feature fusion (1423 -> main_dim)
+  Feature fusion (847 -> main_dim for main_dim=512):
+    RGB 640 -> main_dim//2 | Diff 640 -> main_dim//2
+    feat_delta 640 -> 64 | FrameSim 192 -> main_dim//4
+    ColorHistSim 128 -> main_dim//4 | Motion 15 -> 15 (LayerNorm only)
+    concat -> 2-step MLP -> main_dim
     |
   ProgressiveFusionBlock x N (dilated convs + attention)
     |
@@ -33,13 +37,6 @@ ARCHITECTURE (kept from proven components):
     head_y -> [B, T, 1] one_hot (midpoint of transitions)
     head_z -> [B, T, 1] many_hot (all gradual frames)
 
-REMOVED (dead weight / counterproductive):
-  - ReasoningModule, MotionDynamicsExtractor (acceleration/jerk not discriminative)
-  - TemporalSimilarity (unused, weak discriminator)
-  - MultiLevelTemporalAggregation (redundant with dilated convs)
-  - TemporalPyramidPooling (redundant temporal pooling)
-  - GradualTransitionDetector (covered by dilated convs at long dilations)
-  - Old BoundaryDetectionHead with type coupling (gradient contamination)
 """
 
 import torch
@@ -190,9 +187,9 @@ class EdgeDensityExtractor(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [B, 256, 6, 8] spatial CNN features
+            x: [B*T, 256, 3, 4] spatial CNN features (for default H=48, W=64 input)
         Returns:
-            [B, 64] edge density features
+            [B*T, 64] edge density features (32 variance + 32 mean, globally pooled)
         """
         B, C, H, W = x.shape
         edges = torch.abs(self.edge_conv(x))
@@ -213,10 +210,10 @@ class EfficientSpatialEncoder(nn.Module):
         stem3d sees ±7 frames at pixel level → detects dissolve blending/motion blur.
         Used for: rgb_features (temporal context), diff_features.
 
-      forward_per_frame() — 2D-only path (entry2d → body)
+      forward_per_frame() — 2D-only path (stem_spatial → MaxPool → body)
         NO temporal mixing: each frame processed independently.
         Used for: FrameSimilarity, feat_delta (need sharp cut signatures).
-        Reuses the identical body weights — zero extra computation.
+        Reuses the identical body weights — extra compute overhead ~50% of rgb_encoder cost.
 
     Input:  [B, T, C, H, W]
     Output: [B, T, output_dim + 128]  (both paths)
@@ -650,16 +647,18 @@ class HybridBoundaryDetector(nn.Module):
     Hybrid Boundary Detector with AutoShot-Style Dual Heads.
     
     Combines proven feature extraction with AutoShot's dual-head training:
-    - Dual spatial encoders (RGB + multi-distance diffs) with edge extraction
+    - Two independent spatial encoders (RGB + multi-distance diffs), each 640-d output
+    - rgb_encoder body shared between RGB branch and per-frame branch (forward_per_frame)
     - Pixel-level motion features (before CNN encoding)
-    - Color histogram features (gradual detection via palette shifts)
+    - Color histogram similarity features (pairwise palette cosine sim)
     - Progressive fusion blocks (dilated convs + attention)
     - Dual boundary heads (one_hot midpoint + many_hot extent)
-    
-    Feature pipeline (proportional projection → no gradient dilution or over-compression):
-      RGB 640 → main_dim//2 | Diff 640 → main_dim//2 | FrameSim 128 → main_dim//4
-      ColorHistSim 128 → main_dim//4 | Motion 15 → 32
-      concat → 2-step MLP → main_dim
+
+    Feature pipeline (for main_dim=512):
+      RGB 640 → main_dim//2 (256) | Diff 640 → main_dim//2 (256)
+      feat_delta 640 → 64         | FrameSim 192 → main_dim//4 (128)
+      ColorHistSim 128 → main_dim//4 (128) | Motion 15 → 15 (LayerNorm only)
+      concat (847) → 2-step MLP → main_dim
     """
     def __init__(self, main_dim=512, num_fusion_blocks=3):
         super().__init__()
@@ -667,13 +666,13 @@ class HybridBoundaryDetector(nn.Module):
         # Pixel-level motion extractor (BEFORE CNN encoding)
         self.pixel_motion_extractor = PixelMotionExtractor()
 
-        # Dual spatial encoders: 640 dims each (output_dim=512 + 128 edge)
-        # The 3D stem blends ±7 temporal neighbours at pixel level.
-        # Use rgb_encoder.forward_per_frame() for FrameSimilarity and feat_delta.
+        # Two independent spatial encoders: 640 dims each (output_dim=512 GAP + 128 edge).
+        # rgb_encoder: pseudo-3D dilated stem (dilations 1,2,4 → ±7 frame RF).
+        #   forward()           → 3D-blended features (RGB branch)
+        #   forward_per_frame() → 2D sharp features (per-frame branch, reuses body weights)
+        # diff_encoder: independent encoder (separate body weights) for 15-ch diff input.
         self.rgb_encoder  = EfficientSpatialEncoder(input_channels=3,  output_dim=512)
         self.diff_encoder = EfficientSpatialEncoder(input_channels=15, output_dim=512)
-        # Note: per_frame_features reuse rgb_encoder's body via forward_per_frame().
-        # No separate encoder needed — zero duplicate conv computation.
 
         # AutoShot-style similarity features (the dominant discriminators)
         # Three temporal scales give explicit short / medium / long-range context:
@@ -708,15 +707,15 @@ class HybridBoundaryDetector(nn.Module):
         # Per-stream projections: proportional to information content.
         #   RGB   640 → main_dim//2  (primary, most info-rich — 3D stem features)
         #   Diff  640 → main_dim//2  (primary — 3D stem on multi-dist diffs)
-        #   Feat delta 640 → 64      (2D per-frame features — sharp cut spike)
-        #   FSim  128 → main_dim//4  (key discriminator — 2D per-frame cosine sims)
+        #   feat_delta 640 → 64      (2D per-frame backward diff — sharp cut spike)
+        #   FSim  192 → main_dim//4  (3×64 from windows 15,51,127 — cosine sims)
         #   CSim  128 → main_dim//4  (key discriminator — palette sims)
-        #   Motion 15               (raw — already compact, no compression needed)
+        #   Motion 15 → 15           (LayerNorm only — no projection, keeps raw stats)
         rgb_dim    = main_dim // 2   # 256 for main_dim=512
-        diff_dim   = main_dim // 2   # 256
-        delta_dim  = 64              # feature-level delta: fixed small dim
-        sim_dim    = main_dim // 4   # 128
-        motion_out = 15              # pass raw motion features — no projection loss
+        diff_dim   = main_dim // 2   # 256 for main_dim=512
+        delta_dim  = 64              # feat_delta: 640 → 64 (fixed)
+        sim_dim    = main_dim // 4   # 128 for main_dim=512
+        motion_out = 15              # motion stays at 15 — LayerNorm only, no projection
         fuse_in    = rgb_dim + diff_dim + delta_dim + sim_dim + sim_dim + motion_out
         # = 256 + 256 + 64 + 128 + 128 + 15 = 847 for main_dim=512
 
@@ -731,7 +730,7 @@ class HybridBoundaryDetector(nn.Module):
             nn.Linear(640, delta_dim), nn.LayerNorm(delta_dim), nn.GELU()
         )
         self.frame_sim_proj = nn.Sequential(
-            nn.Linear(192, sim_dim), nn.LayerNorm(sim_dim), nn.GELU()  # 3×64 → sim_dim
+            nn.Linear(192, sim_dim), nn.LayerNorm(sim_dim), nn.GELU()  # 3×64 (windows 15,51,127) → sim_dim
         )
         self.color_sim_proj = nn.Sequential(
             nn.Linear(128, sim_dim), nn.LayerNorm(sim_dim), nn.GELU()
@@ -793,12 +792,12 @@ class HybridBoundaryDetector(nn.Module):
                 all_diffs[:, dist:, i*C:(i+1)*C] = x[:, dist:] - x[:, :-dist]
         
         # 3. Spatial encoding
-        # Two paths through EfficientSpatialEncoder — same body weights, different stems:
-        #   forward()           — 3D stem (±7 frame RF): blends temporal context.
-        #                         Good for rgb_features, diff_features (gradual  detection).
-        #   forward_per_frame() — 2D only (no temporal mix): preserves sharp per-frame.
-        #                         Required for FrameSimilarity + feat_delta so cut spikes
-        #                         are not smeared across neighbours before cosine sim.
+        # rgb_encoder: two forward paths sharing the same conv2/conv3/conv4/GAP/edge body:
+        #   forward()           — pseudo-3D dilated stem (±7 RF): temporally blended features.
+        #                         Used for rgb_features (Branch A).
+        #   forward_per_frame() — 2D only (no temporal mix): sharp per-frame features.
+        #                         Used for FrameSimilarity + feat_delta (Branch C).
+        # diff_encoder: independent encoder (own body weights) for 15-ch diff input (Branch B).
         rgb_features      = self.rgb_encoder(x)               # [B, T, 640] — 3D stem
         diff_features     = self.diff_encoder(all_diffs)       # [B, T, 640] — 3D stem on diffs
         per_frame_feats   = self.rgb_encoder.forward_per_frame(x)  # [B, T, 640] — 2D only, sharp
@@ -888,19 +887,14 @@ def create_hybrid_detector(main_dim=512, num_fusion_blocks=3):
     
     print("\nCORE COMPONENTS (proven effective):")
     print("  - Pixel-level motion features (before CNN encoding)")
-    print("  - FrameSimilarity: CNN-level cosine sim in ±63 frame window (AutoShot key)")
+    print("  - FrameSimilarity: CNN-level cosine sim at 3 scales (windows 15, 51, 127) (AutoShot key)")
     print("  - ColorHistogramSimilarity: palette cosine sim in ±63 frame window (AutoShot key)")
     print("  - Dual spatial encoders (RGB + multi-distance diffs)")
     print("  - Edge density extractor (3.172 separation score)")
     print("  - Multi-scale dilated convs (dilations 1, 4, 16, 64)")
     print("  - Lightweight temporal attention (global context)")
     print("  - Progressive fusion blocks (gated local + global)")
-    
-    print("\nREMOVED (dead weight):")
-    print("  - ReasoningModule + MotionDynamicsExtractor (accel/jerk not discriminative)")
-    print("  - TemporalSimilarity, MultiLevelTemporalAggregation (redundant)")
-    print("  - TemporalPyramidPooling, GradualTransitionDetector (covered by dilated convs)")
-    print("  - Old type head with gradient contamination")
+
     
     model = HybridBoundaryDetector(
         main_dim=main_dim,
