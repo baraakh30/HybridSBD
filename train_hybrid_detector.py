@@ -770,7 +770,7 @@ def main():
         
         # Model architecture
         'main_dim': 384,          # Reduced 512→384: 512 has too much capacity for this dataset size
-        'num_fusion_blocks': 3,
+        'num_fusion_blocks': 4,
         
         # Resume training
         'resume': args.resume,  # Path to checkpoint to resume from
@@ -1049,7 +1049,7 @@ def main():
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=config['num_epochs'] - warmup_epochs,
-        eta_min=1e-6
+        eta_min=5e-6
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,

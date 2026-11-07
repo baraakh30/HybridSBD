@@ -34,12 +34,13 @@ from pathlib import Path
 from multiprocessing import Pool, Manager, cpu_count
 from tqdm import tqdm
 import random
+import hashlib
 from torchcodec.decoders import VideoDecoder
 
 # Configuration (MUST match train_turbo_sbd_v2.py exactly)
 CONFIG = {
-    'input_root': r"C:\Users\baraa\Documents\ClipShots",
-    'output_root': r"D:\grad\data\training_cache",
+    'input_root': os.environ.get('CLIPSHOTS_ROOT', r"C:\Users\baraa\Documents\ClipShots"),
+    'output_root': os.environ.get('CLIPSHOTS_CACHE', r"D:\grad\data\training_cache"),
     'frame_size': (48, 64),  # H, W
     'seq_len': 128,
     'samples_per_video_train': 20,  # MUST match training
@@ -333,20 +334,35 @@ def process_video_worker(args):
             print(f"⚠️  {vid_name}: Corrupted metadata, regenerating...")
     
     try:
-        # Generate sample positions
-        if split == 'train':
+        # Generate sample positions. Protocol-A test inference uses complete
+        # 128-frame sliding windows with stride 64 and always includes the
+        # final aligned window.
+        if split == 'test':
+            total_frames = int(annotations[vid_name]['frame_num'])
+            last_start = max(0, total_frames - seq_len)
+            starts = list(range(0, last_start + 1, 64))
+            if not starts or starts[-1] != last_start:
+                starts.append(last_start)
+            clip_samples = [
+                {'start_frame': int(start), 'is_transition_focused': False}
+                for start in sorted(set(starts))
+            ]
+        elif split == 'train':
             deterministic = False
             samples_per_video = CONFIG['samples_per_video_train']
-        else:  # val or test
+            clip_samples = None
+        else:  # val
             deterministic = True
             samples_per_video = CONFIG['samples_per_video_val']
-        
-        # Use video-specific seed for reproducibility
-        vid_seed = CONFIG['random_seed'] + hash(vid_name) % 10000
-        clip_samples = generate_clip_samples(
-            vid_name, annotations, seq_len, samples_per_video,
-            deterministic=deterministic, seed=vid_seed
-        )
+            clip_samples = None
+
+        if clip_samples is None:
+            stable_seed = int(hashlib.md5(vid_name.encode('utf-8')).hexdigest(), 16) % (2**31)
+            vid_seed = CONFIG['random_seed'] + stable_seed % 10000
+            clip_samples = generate_clip_samples(
+                vid_name, annotations, seq_len, samples_per_video,
+                deterministic=deterministic, seed=vid_seed
+            )
         
         # Get total frames
         total_frames = int(annotations[vid_name]['frame_num'])
@@ -588,8 +604,14 @@ if __name__ == '__main__':
                        help='Number of parallel workers')
     parser.add_argument('--max_videos', type=int, default=None, 
                        help='Max videos to extract (for only_gradual balancing, recommend ~250)')
+    parser.add_argument('--input_root', type=str, default=None)
+    parser.add_argument('--output_root', type=str, default=None)
     
     args = parser.parse_args()
+    if args.input_root:
+        CONFIG['input_root'] = args.input_root
+    if args.output_root:
+        CONFIG['output_root'] = args.output_root
     
     # Check available memory
     free_mem = get_free_memory_gb()

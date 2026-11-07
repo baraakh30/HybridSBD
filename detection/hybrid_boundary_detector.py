@@ -218,8 +218,9 @@ class EfficientSpatialEncoder(nn.Module):
     Input:  [B, T, C, H, W]
     Output: [B, T, output_dim + 128]  (both paths)
     """
-    def __init__(self, input_channels=3, output_dim=512):
+    def __init__(self, input_channels=3, output_dim=512, use_edge_head=True):
         super().__init__()
+        self.use_edge_head = use_edge_head
 
         # --- Temporal path: pseudo-3D stacked-channel Conv2d stem ---
         # Strategy: spatial downsample FIRST (cheap, 4x fewer activations), then
@@ -280,10 +281,14 @@ class EfficientSpatialEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1),
         )
-        self.edge_extractor = EdgeDensityExtractor(in_channels=256)
-        self.edge_proj = nn.Sequential(
-            nn.Linear(64, 128), nn.LayerNorm(128), nn.GELU()
-        )
+        if use_edge_head:
+            self.edge_extractor = EdgeDensityExtractor(in_channels=256)
+            self.edge_proj = nn.Sequential(
+                nn.Linear(64, 128), nn.LayerNorm(128), nn.GELU()
+            )
+        else:
+            self.edge_extractor = None
+            self.edge_proj = None
 
     def forward_per_frame(self, x):
         """
@@ -323,8 +328,10 @@ class EfficientSpatialEncoder(nn.Module):
         x2d = self.conv3(x2d)
         x2d = self.conv4(x2d)
         pooled = self.gap_proj(self.gap(x2d))
-        edge   = self.edge_proj(self.edge_extractor(x2d))
-        return torch.cat([pooled, edge], dim=-1)
+        if self.use_edge_head:
+            edge = self.edge_proj(self.edge_extractor(x2d))
+            return torch.cat([pooled, edge], dim=-1)
+        return pooled
 
     def forward(self, x):
         """
@@ -519,17 +526,21 @@ class ProgressiveFusionBlock(nn.Module):
     2. Global context (attention) - refinement
     3. Gated fusion - learn what to keep from each
     """
-    def __init__(self, dim):
+    def __init__(self, dim, use_attention=True):
         super().__init__()
+        self.use_attention = use_attention
         
         self.local_conv = MultiScaleDilatedConv(dim)
-        self.global_attn = LightweightTemporalAttention(dim)
-        
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(0.1),
-            nn.Sigmoid()
-        )
+        if use_attention:
+            self.global_attn = LightweightTemporalAttention(dim)
+            self.gate = nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.Dropout(0.1),
+                nn.Sigmoid()
+            )
+        else:
+            self.global_attn = None
+            self.gate = None
 
         # fusion now takes dim input (the gated-weighted blend), not dim*2
         self.fusion = nn.Sequential(
@@ -547,6 +558,9 @@ class ProgressiveFusionBlock(nn.Module):
             [B, T, C] fused local + global features
         """
         local_feat  = self.local_conv(x)
+        if not self.use_attention:
+            return x + self.fusion(local_feat)
+
         global_feat = self.global_attn(local_feat)  # attention refines local conv output, not raw x
 
         combined     = torch.cat([local_feat, global_feat], dim=-1)  # [B, T, dim*2]

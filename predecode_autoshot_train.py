@@ -26,12 +26,13 @@ from pathlib import Path
 from multiprocessing import Pool
 from tqdm import tqdm
 import random
+import hashlib
 from torchcodec.decoders import VideoDecoder
 
 # Configuration
 CONFIG = {
-    'autoshot_root': r"D:\grad\data\autoshot",  # Root directory with videos and annotations
-    'output_root': r"D:\grad\data\autoshot_cache_train\train",  # Output cache directory for TRAINING
+    'autoshot_root': os.environ.get('AUTOSHOT_ROOT', r"D:\grad\data\autoshot"),
+    'output_root': os.environ.get('AUTOSHOT_CACHE', r"D:\grad\data\autoshot_cache_train\train"),
     'annotation_file': 'kuaishou_v2.txt',  # Annotation file name
     'video_dirs': ['original_videos', 'video_download', 'ads_game_videos'],  # All video dirs (878 total)
     'frame_size': (48, 64),  # H, W (same as ClipShots)
@@ -320,7 +321,8 @@ def process_video_worker(args):
         if len(valid_transitions) < len(transitions):
             print(f"⚠️  {vid_name}: filtered {len(transitions) - len(valid_transitions)} transitions beyond video length", flush=True)
         
-        vid_seed = CONFIG['random_seed'] + hash(vid_name) % 10000
+        stable_seed = int(hashlib.md5(vid_name.encode('utf-8')).hexdigest(), 16) % (2**31)
+        vid_seed = CONFIG['random_seed'] + stable_seed % 10000
         clip_samples = generate_clip_samples(
             total_frames, valid_transitions, seq_len, samples_per_video, seed=vid_seed
         )
@@ -620,8 +622,14 @@ if __name__ == '__main__':
                        help='Number of parallel workers')
     parser.add_argument('--samples_per_video', type=int, default=None,
                        help='Samples per video (default: 20)')
+    parser.add_argument('--autoshot_root', type=str, default=None)
+    parser.add_argument('--output_root', type=str, default=None)
     
     args = parser.parse_args()
+    if args.autoshot_root:
+        CONFIG['autoshot_root'] = args.autoshot_root
+    if args.output_root:
+        CONFIG['output_root'] = args.output_root
     
     # Check available memory
     free_mem = get_free_memory_gb()

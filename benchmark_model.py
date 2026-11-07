@@ -32,6 +32,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from detection.hybrid_boundary_detector import create_hybrid_detector
+from load_ablation_model import load_detector
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +130,7 @@ def benchmark_one(ckpt_path: str, device: torch.device,
     num_fusion_blocks= mcfg.get('num_fusion_blocks', 3)
     epoch            = ckpt.get('epoch', '?')
 
-    model = create_hybrid_detector(
-        main_dim=main_dim,
-        num_fusion_blocks=num_fusion_blocks,
-    ).to(device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    model, ckpt = load_detector(ckpt_path, device)
     model.eval()
 
     total_params, _ = count_parameters(model)

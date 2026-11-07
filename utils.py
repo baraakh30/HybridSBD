@@ -1,6 +1,8 @@
 import torch
+import os
 import numpy as np
 import random
+import torch
 
 CONFIG = {
     'input_root': r"C:\Users\baraa\Documents\ClipShots",
@@ -31,6 +33,7 @@ def set_seed(seed=42):
     """Set random seeds for reproducibility"""
     random.seed(seed)
     np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
@@ -39,6 +42,7 @@ def set_seed(seed=42):
 def worker_init_fn(worker_id):
     """Initialize worker with unique seed for reproducibility"""
     worker_seed = CONFIG['random_seed'] + worker_id
+    torch.manual_seed(worker_seed)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 

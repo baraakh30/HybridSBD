@@ -38,6 +38,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
+from load_ablation_model import load_detector
 
 # ── shared evaluation engine from test_autoshot ───────────────────────────────
 from test_autoshot import (
@@ -177,6 +178,7 @@ def main():
     parser.add_argument('--tolerance', type=int, default=2,
                         help='Frame tolerance for scene matching')
     parser.add_argument('--output', type=str, default='clipshots_results.json')
+    parser.add_argument('--min_scene_lengths', type=int, nargs='+', default=[1, 2, 3, 4])
     args = parser.parse_args()
 
     config = vars(args)
@@ -201,14 +203,7 @@ def main():
 
     # --- model ---
     print("\nLoading model...")
-    ckpt  = torch.load(config['checkpoint'], map_location=device, weights_only=False)
-    mcfg  = ckpt.get('config', {})
-    model = create_hybrid_detector(
-        main_dim=mcfg.get('main_dim', 512),
-        num_fusion_blocks=mcfg.get('num_fusion_blocks', 3),
-    )
-    model.load_state_dict(ckpt['model_state_dict'])
-    model = model.to(device)
+    model, ckpt = load_detector(config['checkpoint'], device)
     print(f"✓ Loaded from epoch {ckpt.get('epoch', '?')}")
 
     # --- ground truth ---

@@ -34,6 +34,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
+from load_ablation_model import load_detector
 
 
 def collate_autoshot_batch(batch):
@@ -223,6 +224,19 @@ def reconstruct_full_video(video_clips):
     return video_y, video_z
 
 
+def apply_min_scene_length(pred_scenes, min_scene_len):
+    """Merge predicted scenes shorter than the Protocol-A minimum length."""
+    if min_scene_len <= 1 or len(pred_scenes) <= 1:
+        return pred_scenes
+    filtered = [pred_scenes[0].copy()]
+    for scene in pred_scenes[1:]:
+        if int(scene[1] - scene[0] + 1) < min_scene_len:
+            filtered[-1] = np.array([filtered[-1][0], scene[1]], dtype=np.int32)
+        else:
+            filtered.append(scene.copy())
+    return np.asarray(filtered, dtype=np.int32)
+
+
 @torch.no_grad()
 def evaluate(model, test_loader, device, gt_scenes_dict, config):
     """
@@ -241,28 +255,31 @@ def evaluate(model, test_loader, device, gt_scenes_dict, config):
                            0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
     gradual_thresholds  = [0.3, 0.4, 0.5, 0.6]  # inner sweep; z is auxiliary
 
-    print(f"\nSweeping {len(boundary_thresholds)} x {len(gradual_thresholds)} thresholds...")
-    best_f1, best_bt, best_gt = 0.0, 0.5, 0.5
+    min_scene_lengths = config.get('min_scene_lengths', [1])
+    print(f"\nSweeping {len(boundary_thresholds)} x {len(gradual_thresholds)} x "
+          f"{len(min_scene_lengths)} Protocol-A settings...")
+    best_f1, best_bt, best_gt, best_lmin = 0.0, 0.5, 0.5, 1
     all_results = {}
 
     for bt in tqdm(boundary_thresholds, desc="Sweep"):
         for gt in gradual_thresholds:
-            tp = fp = fn = 0
-            for vid in video_y:
-                if vid not in gt_scenes_dict:
-                    continue
-                pred_mh = _build_pred_many_hot(video_y[vid], video_z[vid], bt, gt)
-                pred_sc = predictions_to_scenes(pred_mh)
-                gt_sc   = gt_scenes_dict[vid]
-                _, _, _, (t, f, n) = evaluate_scenes(gt_sc, pred_sc,
-                                                      n_frames_miss_tolerance=config['tolerance'])
-                tp += t; fp += f; fn += n
-            p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-            all_results[(bt, gt)] = dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn)
-            if f1 > best_f1:
-                best_f1, best_bt, best_gt = f1, bt, gt
+            for lmin in min_scene_lengths:
+                tp = fp = fn = 0
+                for vid in video_y:
+                    if vid not in gt_scenes_dict:
+                        continue
+                    pred_mh = _build_pred_many_hot(video_y[vid], video_z[vid], bt, gt)
+                    pred_sc = apply_min_scene_length(predictions_to_scenes(pred_mh), lmin)
+                    gt_sc   = gt_scenes_dict[vid]
+                    _, _, _, (t, f, n) = evaluate_scenes(gt_sc, pred_sc,
+                                                          n_frames_miss_tolerance=config['tolerance'])
+                    tp += t; fp += f; fn += n
+                p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+                all_results[(bt, gt, lmin)] = dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn)
+                if f1 > best_f1:
+                    best_f1, best_bt, best_gt, best_lmin = f1, bt, gt, lmin
 
     # --- per-video results at best thresholds ---
     video_results = {}
@@ -270,17 +287,18 @@ def evaluate(model, test_loader, device, gt_scenes_dict, config):
         if vid not in gt_scenes_dict:
             continue
         pred_mh = _build_pred_many_hot(video_y[vid], video_z[vid], best_bt, best_gt)
-        pred_sc = predictions_to_scenes(pred_mh)
+        pred_sc = apply_min_scene_length(predictions_to_scenes(pred_mh), best_lmin)
         gt_sc   = gt_scenes_dict[vid]
         p, r, f1, (tp, fp, fn) = evaluate_scenes(gt_sc, pred_sc,
                                                    n_frames_miss_tolerance=config['tolerance'])
         video_results[vid] = dict(p=p, r=r, f1=f1, tp=tp, fp=fp, fn=fn,
                                   n_gt=len(gt_sc), n_pred=len(pred_sc))
 
-    best = all_results[(best_bt, best_gt)]
+    best = all_results[(best_bt, best_gt, best_lmin)]
     return {
         'best_boundary_threshold': best_bt,
         'best_gradual_threshold':  best_gt,
+        'best_min_scene_len': best_lmin,
         'overall': best,
         'all_results': {str(k): v for k, v in all_results.items()},
         'video_results': video_results,
@@ -296,6 +314,7 @@ def main():
     parser.add_argument('--tolerance', type=int, default=2,
                         help='Frame tolerance for scene matching (AutoShot default=2)')
     parser.add_argument('--output', type=str, default='autoshot_results.json')
+    parser.add_argument('--min_scene_lengths', type=int, nargs='+', default=[1])
     args = parser.parse_args()
 
     config = vars(args)
@@ -319,14 +338,7 @@ def main():
 
     # --- model ---
     print("\nLoading model...")
-    ckpt  = torch.load(config['checkpoint'], map_location=device, weights_only=False)
-    mcfg  = ckpt.get('config', {})
-    model = create_hybrid_detector(
-        main_dim=mcfg.get('main_dim', 512),
-        num_fusion_blocks=mcfg.get('num_fusion_blocks', 3),
-    )
-    model.load_state_dict(ckpt['model_state_dict'])
-    model = model.to(device)
+    model, ckpt = load_detector(config['checkpoint'], device)
     print(f"\u2713 Loaded from epoch {ckpt.get('epoch', '?')}")
 
     # --- ground truth ---

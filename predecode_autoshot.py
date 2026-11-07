@@ -28,8 +28,8 @@ from multiprocessing import Pool, cpu_count
 
 # Configuration
 CONFIG = {
-    'autoshot_root': r"d:\grad\data\autoshot",
-    'output_root': r"d:\grad\data\autoshot_cache",
+    'autoshot_root': os.environ.get('AUTOSHOT_ROOT', r"d:\grad\data\autoshot"),
+    'output_root': os.environ.get('AUTOSHOT_TEST_CACHE', r"d:\grad\data\autoshot_cache"),
     'frame_size': (48, 64),  # H, W - match training
     'seq_len': 128,
     'stride': 64,  # Sliding window stride for full video coverage

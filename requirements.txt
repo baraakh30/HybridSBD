@@ -33,6 +33,9 @@ h5py>=3.7.0
 pyyaml>=6.0
 omegaconf>=2.2.0
 wandb>=0.13.0  # For experiment tracking
+psutil>=5.9.0
+torchcodec>=0.1.0
+gdown>=5.2.0
 
 # Video processing
 imageio[ffmpeg]>=2.20.0
