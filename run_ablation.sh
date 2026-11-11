@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
+# Train Protocol-A variants. One command per run, all 13 predefined.
+#   bash run_ablation.sh                 # all 13 in spec order
+#   RUNS="A0" bash run_ablation.sh       # only some runs
+# Completed runs are skipped; an unfinished run aborts (use FORCE=1 to archive+retrain).
 set -euo pipefail
-
-DATA_ROOT="${DATA_ROOT:-data}"
-AUTOSHOT_CACHE="${AUTOSHOT_CACHE:-$DATA_ROOT/cache/autoshot_train}"
-CLIPSHOTS_CACHE="${CLIPSHOTS_CACHE:-$DATA_ROOT/cache/clipshots}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/ablations}"
+cd "$(dirname "$0")"
+source ./protocol_a_env.sh
+RUNS="${RUNS:-$ALL_RUNS}"
 EPOCHS="${EPOCHS:-80}"
+FORCE_FLAG=""; [[ "${FORCE:-0}" == "1" ]] && FORCE_FLAG="--force"
 
-python prepare_ablation_data.py --data_root "$DATA_ROOT" --num_workers "${NUM_WORKERS:-8}"
+if [[ "${SKIP_PREP:-0}" != "1" ]]; then
+  "$PY" prepare_ablation_data.py --data_root "$DATA_ROOT" --num_workers "$NUM_WORKERS" $EXCLUDE_FLAG 2>&1 | tee -a "$LOG_DIR/prepare_data.log"
+fi
 
-for RUN_ID in A0 A1 A2 A3 A4 C1 C2a C2b C3 C4 C5a C5b C6; do
-  python train_ablation.py --run_id "$RUN_ID" \
-    --autoshot_cache "$AUTOSHOT_CACHE" \
-    --clipshots_cache "$CLIPSHOTS_CACHE" \
-    --output_root "$OUTPUT_ROOT" --epochs "$EPOCHS"
+for RUN_ID in $RUNS; do
+  echo "=== training $RUN_ID ==="
+  "$PY" train_ablation.py --run_id "$RUN_ID" \
+    --autoshot_cache "$AUTOSHOT_TRAIN_CACHE" --clipshots_cache "$CLIPSHOTS_CACHE" \
+    --output_root "$OUTPUT_ROOT" --epochs "$EPOCHS" --num_workers "$TRAIN_WORKERS" $FORCE_FLAG
 done
-
-python export_ablation_csv.py --output_root "$OUTPUT_ROOT" --output "$OUTPUT_ROOT/ablation_results.csv"

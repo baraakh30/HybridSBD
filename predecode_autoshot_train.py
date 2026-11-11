@@ -57,113 +57,75 @@ def wait_for_memory(min_gb=3.0, check_interval=5):
 
 def parse_autoshot_annotations(annotation_file):
     """
-    Parse AutoShot annotation file (kuaishou_v2.txt format)
-    
-    Format (two variants):
-        Variant 1 (with frame count):
-            video_name.mp4 total_frames
-            start,end
-            start,end
-            ...
-            <blank line>
-        
-        Variant 2 (without frame count):
-            video_name.mp4
-            start end
-            start end
-            ...
-            <blank line>
-    
-    Returns:
-        annotations: dict {video_name: {'frame_num': int, 'transitions': [(start, end), ...]}}
+    Parse AutoShot's label file (kuaishou_v2.txt).
+
+    Per video:   a header line  "<id>.mp4 [total_frames]"  followed by one transition per line, then a blank line.
+    The file is not perfectly regular (checked against the real file), so parsing is deliberately tolerant:
+      * header: the video ID is the leading digits before ".mp4" (one header reads "<id>.mp4.png");
+      * transition lines: "a,b", "a b", "a.b", "a,,b", "a,b,", or two transitions joined by a control character
+        ("a,b\x0bc,d"): all integers on the line are read and paired in order. A line with an odd number of integers
+        is malformed and skipped (2 such lines exist).
+    Duplicate headers (90, identical copies for train-only videos) keep the last occurrence.
+
+    Returns: {video_name: {'frame_num': int or None, 'transitions': [(start, end), ...]}}
     """
+    import re
     print(f"Parsing AutoShot annotations from {annotation_file}...")
-    
+
     annotations = {}
     current_video = None
     duplicate_count = 0
-    
-    with open(annotation_file, 'r') as f:
+    odd_lines = 0
+
+    with open(annotation_file, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
             line = line.strip()
-            
             if not line:
-                # Blank line - end of video
                 current_video = None
                 continue
-            
-            # Check if this is a video header (must contain .mp4)
-            if '.mp4' in line:
-                # Video header: "video_name.mp4" or "video_name.mp4 total_frames"
-                parts = line.split()
-                video_name = parts[0]
-                
-                # Detect duplicates
+
+            header = re.match(r'^(\d+)\.mp4\b(?:\S*)?(?:\s+(\d+))?\s*$', line)
+            if header:
+                video_name = header.group(1) + '.mp4'
                 if video_name in annotations:
                     duplicate_count += 1
-                
-                # Extract frame count if provided, otherwise set to None (we'll infer later)
-                if len(parts) >= 2:
-                    try:
-                        total_frames = int(parts[1])
-                    except ValueError:
-                        total_frames = None  # Will infer from max transition frame
-                else:
-                    total_frames = None
-                
                 annotations[video_name] = {
-                    'frame_num': total_frames,
+                    'frame_num': int(header.group(2)) if header.group(2) else None,
                     'transitions': []
                 }
                 current_video = video_name
-            
             elif current_video:
-                # Transition line: handle multiple formats:
-                # - "start,end"
-                # - "start end"
-                # - "[start,end]"
-                # - "[start end]"
-                
-                # Strip square brackets if present
-                line_clean = line.strip('[]')
-                
-                if ',' in line_clean:
-                    # Comma-separated format
-                    parts = line_clean.split(',')
-                else:
-                    # Space-separated format
-                    parts = line_clean.split()
-                
-                if len(parts) == 2 and parts[0] and parts[1]:
-                    try:
-                        start, end = int(parts[0].strip()), int(parts[1].strip())
-                        # Skip invalid transitions (end < start is malformed annotation)
-                        if end >= start:
-                            annotations[current_video]['transitions'].append((start, end))
-                        else:
-                            print(f"⚠️  Skipping malformed transition in {current_video}: {line} (end < start)")
-                    except ValueError as e:
-                        print(f"⚠️  Skipping invalid transition in {current_video}: {line} (parse error: {e})")
-    
-    # Infer missing frame counts from max transition frame
+                nums = [int(x) for x in re.findall(r'\d+', line)]
+                if len(nums) % 2:
+                    odd_lines += 1
+                    print(f"⚠️  Skipping malformed transition line in {current_video}: {line!r}")
+                    continue
+                for i in range(0, len(nums), 2):
+                    start, end = nums[i], nums[i + 1]
+                    if end >= start:
+                        annotations[current_video]['transitions'].append((start, end))
+                    else:
+                        print(f"⚠️  Skipping malformed transition in {current_video}: {start},{end} (end < start)")
+
+    # Infer missing frame counts from the last transition frame
+    inferred = 0
     for vid_name, vid_data in annotations.items():
         if vid_data['frame_num'] is None and vid_data['transitions']:
-            max_frame = max(end for _, end in vid_data['transitions'])
-            vid_data['frame_num'] = max_frame + 100  # Add buffer for safety
-            print(f"ℹ️  Inferred frame count for {vid_name}: {vid_data['frame_num']} (from transitions)")
-    
+            vid_data['frame_num'] = max(end for _, end in vid_data['transitions']) + 100
+            inferred += 1
+    if inferred:
+        print(f"ℹ️  {inferred} videos have no frame count in the label file: inferred as last transition + 100 "
+              f"(the real count is taken from the decoded video; later transitions beyond it are filtered)")
+
     print(f"✓ Parsed {len(annotations)} unique videos")
     if duplicate_count > 0:
         print(f"  ℹ️  Note: {duplicate_count} duplicate entries found (kept last occurrence)")
-    
-    # Statistics
+
     total_transitions = sum(len(v['transitions']) for v in annotations.values())
     cuts = sum(1 for v in annotations.values() for s, e in v['transitions'] if e - s <= 1)
     graduals = total_transitions - cuts
-    
     print(f"  Total transitions: {total_transitions} (Cuts: {cuts}, Graduals: {graduals})")
-    print(f"  Avg transitions per video: {total_transitions / len(annotations):.1f}")
-    
+    print(f"  Avg transitions per video: {total_transitions / max(1, len(annotations)):.1f}")
     return annotations
 
 
@@ -328,7 +290,17 @@ def process_video_worker(args):
         )
         
         clip_metadata = []
-        
+
+        # Decode the whole video ONCE (frames are resized as they stream by) and cut the clips from memory. Every clip
+        # used to be decoded on its own (keyframe seek + decode forward), so each frame was decoded ~10x. Same frames,
+        # ~10x less CPU; a video at 48x64 is only a few MB. Corrupt videos fall back to the old per-clip decode.
+        from frame_utils import decode_resized
+        video_frames = None
+        try:
+            video_frames = decode_resized(decoder, torch.arange(video_length, dtype=torch.long), frame_size, chunk=64)
+        except Exception as e:
+            print(f"⚠️  {vid_name}: full decode failed ({str(e)[:80]}); falling back to per-clip decode", flush=True)
+
         for clip_idx, sample_info in enumerate(clip_samples):
             start_frame = int(sample_info['start_frame'])  # Ensure integer
             
@@ -348,8 +320,10 @@ def process_video_worker(args):
                     
                 frame_indices = torch.arange(start_frame, end_frame, dtype=torch.long)
                 
-                frames = decoder.get_frames_at(frame_indices)
-                frames = frames.data
+                if video_frames is not None:
+                    frames = video_frames[start_frame:end_frame].clone()      # clone: torch.save would store the whole storage
+                else:
+                    frames = decode_resized(decoder, frame_indices, frame_size)   # chunked: bounded memory, same pixels
                 
             except RuntimeError as e:
                 # Handle corrupted video frames gracefully
@@ -458,6 +432,16 @@ def predecode_autoshot(num_workers=4, samples_per_video=None):
         raise FileNotFoundError(f"Annotation file not found: {annotation_file}")
     
     annotations = parse_autoshot_annotations(annotation_file)
+
+    # Optional: drop videos that belong to the SHOT test set (keys of the test GT pickle).
+    if CONFIG.get('exclude_pickle'):
+        import pickle
+        with open(CONFIG['exclude_pickle'], 'rb') as fh:
+            excluded = {str(k) for k in pickle.load(fh).keys()}
+        before = len(annotations)
+        annotations = {k: v for k, v in annotations.items() if Path(k).stem not in excluded}
+        print(f"Excluding {before - len(annotations)} SHOT-test videos from training "
+              f"({before} -> {len(annotations)} videos)")
     
     # Find video files across multiple directories
     video_dirs = [autoshot_root / vdir for vdir in CONFIG['video_dirs']]
@@ -624,8 +608,12 @@ if __name__ == '__main__':
                        help='Samples per video (default: 20)')
     parser.add_argument('--autoshot_root', type=str, default=None)
     parser.add_argument('--output_root', type=str, default=None)
+    parser.add_argument('--exclude_pickle', type=str, default=None,
+                       help='gt_scenes_dict pickle of the SHOT test set; its videos are excluded from training')
     
     args = parser.parse_args()
+    if args.exclude_pickle:
+        CONFIG['exclude_pickle'] = args.exclude_pickle
     if args.autoshot_root:
         CONFIG['autoshot_root'] = args.autoshot_root
     if args.output_root:

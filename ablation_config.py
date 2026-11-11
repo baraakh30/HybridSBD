@@ -65,8 +65,39 @@ VARIANTS = {
     "C6": AblationConfig("C6", use_attention=False),
 }
 
+# Build-up (add-one-in) ablation, NOT part of the 13-run Protocol-A table. Base = A4 (backbone only: RGB encoder + fusion
+# blocks + dual head; no diff branch, no fsim/csim/delta/motion, per-frame pathway unused). Each U_* adds ONE component to the
+# backbone; S_* are cumulative stacks (S3 + diff branch == A0). B_* remove a part of the backbone itself.
+_BASE = dict(supervision="dual", use_branch_b=False, use_branch_c=False, rel_source="rgb",
+             use_fsim=False, use_csim=False, use_delta=False, use_motion=False)
+
+
+def _b(run_id, **kw):
+    return AblationConfig(run_id, **{**_BASE, **kw})
+
+
+BUILDUP = {
+    "U_fsim": _b("U_fsim", use_fsim=True),
+    "U_csim": _b("U_csim", use_csim=True),
+    "U_delta": _b("U_delta", use_delta=True),
+    "U_motion": _b("U_motion", use_motion=True),
+    "U_diff": _b("U_diff", use_branch_b=True),
+    "S1_rel": _b("S1_rel", use_fsim=True, use_csim=True, use_delta=True),
+    "S2_rel_pf": _b("S2_rel_pf", use_fsim=True, use_csim=True, use_delta=True, use_branch_c=True, rel_source="pf"),
+    "S3_rel_pf_motion": _b("S3_rel_pf_motion", use_fsim=True, use_csim=True, use_delta=True, use_branch_c=True,
+                           rel_source="pf", use_motion=True),
+    # Minimal ladder BELOW the backbone: M0 = RGB encoder -> MLP -> dual head only (no edge head, no fusion blocks);
+    # M1 = M0 + edge head; B_noatt = M1 + 4 conv-only fusion blocks; A4 = B_noatt + self-attention/gate.
+    "M0_min": _b("M0_min", use_edge_head=False, num_fusion_blocks=0, use_attention=False),
+    "M1_edge": _b("M1_edge", use_edge_head=True, num_fusion_blocks=0, use_attention=False),
+    "B_noatt": _b("B_noatt", use_attention=False),
+    "B_noedge": _b("B_noedge", use_edge_head=False),
+}
+
 
 def get_variant(run_id: str) -> AblationConfig:
+    if run_id in BUILDUP:
+        return BUILDUP[run_id]
     try:
         return VARIANTS[run_id]
     except KeyError as exc:

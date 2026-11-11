@@ -255,17 +255,10 @@ The final outputs are written under `outputs/ablations/`, including:
 
 ## Validation status
 
-VS Code diagnostics and `git diff --check` reported no errors for the modified
-and added files.
-
-Full dataset downloads, predecoding, GPU forward passes, training, and final
-evaluation were not executed in this local environment because Python, CUDA,
-and the external datasets were unavailable. Consequently, no experimental
-numbers are claimed by this document.
-
-The first cloud execution should begin with the preflight validator and should
-stop on any architecture, dependency, dataset, or overlap failure before
-starting the 13 training runs.
+Superseded by the executed CPU validation recorded in [IMPLEMENTATION_NOTES.md](./IMPLEMENTATION_NOTES.md)
+(`python test_ablation_cpu.py`, 17/17 passed on dummy inputs). Dataset download, predecoding, real training,
+real-data evaluation, the A0 reproduction check, and GPU benchmarking have still NOT been executed; no
+experimental numbers are claimed. Run everything with `bash run_protocol_a_all.sh` (see the notes).
 
 ## Files changed or added
 

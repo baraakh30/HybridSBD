@@ -65,6 +65,9 @@ def measure_inference_time(model, device, batch_size, seq_len=128,
                            num_runs=80, warmup=10):
     """Returns timing stats (ms) and derived FPS for one batch_size."""
     model.eval()
+    if device.type == 'cuda':          # benchmark hygiene (spec checklist item 7)
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.empty_cache()
     x = torch.randn(batch_size, seq_len, 3, FRAME_H, FRAME_W, device=device)
 
     with torch.no_grad():
@@ -237,6 +240,8 @@ def main():
     parser.add_argument('--output',      type=str,
                         default='outputs/benchmark_results.json')
     args = parser.parse_args()
+    from run_logging import tee_to_file
+    tee_to_file(Path(args.output).with_suffix('.log'))
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
@@ -271,6 +276,8 @@ def main():
     with open(args.output, 'w') as f:
         json.dump({
             'timestamp':   datetime.now().isoformat(),
+            'environment': __import__('ablation_config').environment_snapshot(),
+            'protocol':    'B=16 FP32, 10 warm-up + 80 timed, synthetic input, forward pass only',
             'device':      str(device),
             'batch_sizes': args.batch_sizes,
             'seq_len':     args.seq_len,

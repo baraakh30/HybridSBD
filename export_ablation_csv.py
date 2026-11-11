@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     rows = []
+    missing = {}
     for run_id, cfg in VARIANTS.items():
         run_dir = Path(args.output_root) / run_id
         summary_path = run_dir / "summary.json"
@@ -54,6 +55,7 @@ def main():
                                 ("bbc", "bbc_results.json")):
             result_path = run_dir / filename
             if not result_path.exists():
+                missing.setdefault(run_id, []).append(filename)
                 continue
             result = json.loads(result_path.read_text(encoding="utf-8"))
             overall = result.get("overall", {})
@@ -76,13 +78,26 @@ def main():
                     row["latency_B16_ms"] = batch.get("mean_ms", "")
                     row["vram_B16_MB"] = batch.get("peak_memory_mb", "")
                     break
+        if row["latency_B16_ms"] == "":
+            missing.setdefault(run_id, []).append("benchmark (latency/vram)")
         rows.append(row)
+    for run_id in VARIANTS:
+        if not (Path(args.output_root) / run_id / "summary.json").exists():
+            missing.setdefault(run_id, []).append("summary.json (training not completed)")
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    commits = {r["git_commit"] for r in rows if r["git_commit"]}
+    if len(commits) > 1:
+        missing["_warning"] = [f"runs were trained on different git commits: {sorted(commits)} "
+                               "(spec: all runs must use the same commit as A0)"]
+    report = Path(args.output).with_suffix(".missing.json")
+    report.write_text(json.dumps(missing, indent=2), encoding="utf-8")
     print(f"Wrote {len(rows)} rows to {args.output}")
+    if missing:
+        print(f"WARNING: incomplete data, see {report}: {json.dumps(missing)}")
 
 
 if __name__ == "__main__":

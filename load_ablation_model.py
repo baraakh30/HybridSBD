@@ -1,6 +1,21 @@
 """Load either a legacy checkpoint or a Protocol-A ablation checkpoint."""
 
+import hashlib
+
 from detection.hybrid_boundary_detector import create_hybrid_detector
+
+
+def is_single_output(ckpt):
+    """True when the variant's inference rule uses only p_y > tau_c (A1, A2, A3)."""
+    return ckpt.get("config", {}).get("supervision", "dual") != "dual"
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def load_detector(checkpoint, device):

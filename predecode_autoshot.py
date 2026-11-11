@@ -187,7 +187,8 @@ def predecode_video(video_id, video_path, shot_boundaries, output_dir):
             
             # Decode frames (batch mode)
             frame_indices = list(range(start_frame, end_frame))
-            frames = decoder.get_frames_at(frame_indices).data  # [T, 3, H, W]
+            from frame_utils import decode_resized
+            frames = decode_resized(decoder, frame_indices, CONFIG['frame_size'])  # [T, 3, H, W], chunked
             
             # Resize if needed
             if frames.shape[2:] != CONFIG['frame_size']:

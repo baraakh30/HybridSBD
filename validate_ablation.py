@@ -24,13 +24,14 @@ def main():
     results = {"environment": environment_snapshot(), "device": str(device), "variants": {}}
 
     for run_id, cfg in VARIANTS.items():
+        # AMP-free CPU/GPU preflight; exact integer parameter counts are saved below.
         model = create_ablation_detector(cfg).to(device)
         model.eval()
         with torch.no_grad():
             y, z = model(x)
         total, trainable = model.count_parameters()
         row = {
-            "output_shape_y": list(y.shape), "output_shape_z": list(z.shape),
+            "output_shape_y": list(y.shape), "output_shape_z": None if z is None else list(z.shape),
             "fusion_in": model.fusion_in, "embedding_dim": model.emb_dim,
             "parameters_total": total, "parameters_trainable": trainable,
             "head_type": type(model.detection_head).__name__,
@@ -40,7 +41,9 @@ def main():
             row["delta_weight_shape"] = list(model.feat_delta_proj[0].weight.shape)
             row["four_fusion_blocks"] = len(model.fusion_blocks) == 4
             row["a0_parameter_count_rounds_to_millions"] = round(total / 1e6, 1)
-            if model.fusion_in != 655 or len(model.fusion_blocks) != 4:
+            if (model.fusion_in != 655 or len(model.fusion_blocks) != 4
+                    or tuple(model.feat_delta_proj[0].weight.shape) != (64, 640)
+                    or round(total / 1e6, 1) != 10.9):
                 raise AssertionError(f"A0 architecture mismatch: {row}")
         if run_id == "A2" and not isinstance(model.detection_head, UnifiedBoundaryHead):
             raise AssertionError("A2 does not use a single unified head")

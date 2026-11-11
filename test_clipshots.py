@@ -38,7 +38,8 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
-from load_ablation_model import load_detector
+from load_ablation_model import load_detector, is_single_output
+from run_logging import tee_to_file, save_predictions, result_metadata
 
 # ── shared evaluation engine from test_autoshot ───────────────────────────────
 from test_autoshot import (
@@ -182,6 +183,7 @@ def main():
     args = parser.parse_args()
 
     config = vars(args)
+    tee_to_file(Path(config['output']).with_suffix('.log'))
 
     print("\n" + "="*80)
     print("TESTING ON CLIPSHOTS TEST DATASET")
@@ -198,13 +200,14 @@ def main():
     # --- dataset ---
     dataset = ClipShotsPredecodedDataset(config['cache_root'])
     loader  = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False,
-                         num_workers=4, pin_memory=True,
+                         num_workers=int(os.environ.get('EVAL_WORKERS', 4)), pin_memory=True,
                          collate_fn=collate_clipshots_batch)
 
     # --- model ---
     print("\nLoading model...")
     model, ckpt = load_detector(config['checkpoint'], device)
-    print(f"✓ Loaded from epoch {ckpt.get('epoch', '?')}")
+    config['single_output'] = is_single_output(ckpt)
+    print(f"✓ Loaded from epoch {ckpt.get('epoch', '?')}  single_output={config['single_output']}")
 
     # --- ground truth ---
     print("\nLoading ground truth...")
@@ -220,7 +223,8 @@ def main():
     print("="*80)
     print(f"Videos evaluated : {results['num_videos']}")
     print(f"Best boundary thr: {results['best_boundary_threshold']:.2f}")
-    print(f"Best gradual thr : {results['best_gradual_threshold']:.2f}")
+    _g = results['best_gradual_threshold']
+    print(f"Best gradual thr : {'n/a (single output)' if _g is None else format(_g, '.2f')}")
     ov = results['overall']
     print(f"\nOverall  P={ov['p']:.4f}  R={ov['r']:.4f}  F1={ov['f1']:.4f}")
     print(f"         TP={ov['tp']}  FP={ov['fp']}  FN={ov['fn']}")
@@ -237,6 +241,11 @@ def main():
               f"gt_scenes={m['n_gt']}  pred_scenes={m['n_pred']}")
     print("="*80)
 
+    preds = results.pop('_predictions', None)
+    results['metadata'] = result_metadata(config['checkpoint'], config['single_output'], config)
+    if preds is not None:
+        results['predictions_file'] = save_predictions(
+            Path(config['output']).with_suffix('.predictions.npz'), *preds)
     with open(config['output'], 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\n✓ Results saved to {config['output']}")

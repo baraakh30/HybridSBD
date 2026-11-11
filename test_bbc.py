@@ -30,7 +30,8 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detection.hybrid_boundary_detector import create_hybrid_detector
-from load_ablation_model import load_detector
+from load_ablation_model import load_detector, is_single_output
+from run_logging import tee_to_file, save_predictions, result_metadata
 
 
 def collate_bbc_batch(batch):
@@ -167,7 +168,10 @@ def evaluate_scenes(gt_scenes, pred_scenes, n_frames_miss_tolerance=2):
 
 
 def _build_pred_many_hot(y_pred, z_pred, boundary_threshold, gradual_threshold):
-    """Combine y (one_hot midpoint) and z (many_hot extent) → single many_hot array."""
+    """Combine y (one_hot midpoint) and z (many_hot extent) → single many_hot array.
+    gradual_threshold=None -> single-output rule b = p_y > tau_c (A1/A2/A3)."""
+    if gradual_threshold is None:
+        return (y_pred > boundary_threshold).astype(np.uint8)
     pred_is_boundary = y_pred > boundary_threshold
     pred_is_gradual  = z_pred > gradual_threshold
     pred_is_cut      = pred_is_boundary & ~pred_is_gradual
@@ -184,7 +188,8 @@ def run_inference(model, loader, device):
         frames   = batch['frames'].to(device, non_blocking=True)   # [B, T, 3, H, W]
         y_logits, z_logits = model(frames)                          # [B, T, 1] each
         y_probs  = torch.sigmoid(y_logits.squeeze(-1)).cpu().numpy()  # [B, T]
-        z_probs  = torch.sigmoid(z_logits.squeeze(-1)).cpu().numpy()  # [B, T]
+        z_probs  = (np.zeros_like(y_probs) if z_logits is None
+                    else torch.sigmoid(z_logits.squeeze(-1)).cpu().numpy())  # [B, T]
 
         for b in range(frames.shape[0]):
             video_id    = batch['video_id'][b]
@@ -227,10 +232,11 @@ def evaluate(model, loader, device, gt_scenes_dict, config):
 
     boundary_thresholds = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
                            0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
-    gradual_thresholds  = [0.3, 0.4, 0.5, 0.6]
+    single_output = bool(config.get('single_output', False))
+    gradual_thresholds  = [None] if single_output else [0.3, 0.4, 0.5, 0.6]
 
     print(f"\nSweeping {len(boundary_thresholds)} x {len(gradual_thresholds)} thresholds...")
-    best_f1, best_bt, best_gt = 0.0, 0.5, 0.5
+    best_f1, best_bt, best_gt = 0.0, 0.5, gradual_thresholds[0]
     all_results = {}
 
     for bt in tqdm(boundary_thresholds, desc="Sweep"):
@@ -275,6 +281,8 @@ def evaluate(model, loader, device, gt_scenes_dict, config):
 
     best = all_results[(best_bt, best_gt)]
     return {
+        '_predictions': (video_y, None if single_output else video_z),
+        'single_output': single_output,
         'best_boundary_threshold': best_bt,
         'best_gradual_threshold':  best_gt,
         'overall':     best,
@@ -354,6 +362,7 @@ def main():
     args = parser.parse_args()
 
     config = vars(args)
+    tee_to_file(Path(config['output']).with_suffix('.log'))
 
     print("\n" + "=" * 80)
     print("TESTING ON BBC PLANET EARTH DATASET")
@@ -370,13 +379,14 @@ def main():
     # --- dataset ---
     dataset = BBCPredecodedDataset(config['cache_root'])
     loader  = DataLoader(dataset, batch_size=config['batch_size'], shuffle=False,
-                         num_workers=4, pin_memory=True,
+                         num_workers=int(os.environ.get('EVAL_WORKERS', 4)), pin_memory=True,
                          collate_fn=collate_bbc_batch)
 
     # --- model ---
     print("\nLoading model...")
     model, ckpt = load_detector(config['checkpoint'], device)
-    print(f"✓ Loaded from epoch {ckpt.get('epoch', '?')}")
+    config['single_output'] = is_single_output(ckpt)
+    print(f"✓ Loaded from epoch {ckpt.get('epoch', '?')}  single_output={config['single_output']}")
 
     # --- ground truth ---
     print(f"\nLoading ground truth from {config['bbc_root']}...")
@@ -392,7 +402,8 @@ def main():
     print("=" * 80)
     print(f"Videos evaluated  : {results['num_videos']}")
     print(f"Best boundary thr : {results['best_boundary_threshold']:.2f}")
-    print(f"Best gradual thr  : {results['best_gradual_threshold']:.2f}")
+    _g = results['best_gradual_threshold']
+    print(f"Best gradual thr  : {'n/a (single output)' if _g is None else format(_g, '.2f')}")
     ov = results['overall']
     print(f"\nOverall  P={ov['p']:.4f}  R={ov['r']:.4f}  F1={ov['f1']:.4f}")
     print(f"         TP={ov['tp']}  FP={ov['fp']}  FN={ov['fn']}")
@@ -406,6 +417,11 @@ def main():
         print(f"  {vid}: F1={m['f1']:.3f}  P={m['p']:.3f}  R={m['r']:.3f}")
     print("=" * 80)
 
+    preds = results.pop('_predictions', None)
+    results['metadata'] = result_metadata(config['checkpoint'], config['single_output'], config)
+    if preds is not None:
+        results['predictions_file'] = save_predictions(
+            Path(config['output']).with_suffix('.predictions.npz'), *preds)
     with open(config['output'], 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\n✓ Results saved to {config['output']}")

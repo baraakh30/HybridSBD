@@ -35,7 +35,6 @@ class AblationBoundaryLoss(nn.Module):
     def forward(self, y_logits, z_logits, labels, transition_lengths):
         one_hot, many_hot = create_one_hot_many_hot(labels)
         y = y_logits.squeeze(-1)
-        z = z_logits.squeeze(-1)
         if self.supervision == "unified":
             unified = torch.maximum(one_hot, many_hot)
             loss_u = self.focal_bce(y, unified, self.alpha)
@@ -46,6 +45,7 @@ class AblationBoundaryLoss(nn.Module):
             total = self.lambda1 * y_loss
             z_loss = y_loss.detach() * 0.0
         else:
+            z = z_logits.squeeze(-1)
             smooth = many_hot * (1.0 - self.z_label_smoothing)
             z_loss = self.focal_bce(z, smooth, self.alpha_z)
             total = self.lambda1 * y_loss + self.lambda2 * z_loss

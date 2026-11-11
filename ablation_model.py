@@ -110,54 +110,58 @@ class AblationHybridBoundaryDetector(nn.Module):
 
     def forward(self, x, return_features=False):
         b, t, c, h, w = x.shape
-        streams = []
-        motion = None
-        if self.ablation.use_motion:
-            motion = self.pixel_motion_extractor(x)
-            streams.append(self.motion_norm(motion))
+        cfg = self.ablation
+
+        # Stream order is identical to HybridBoundaryDetector:
+        # [rgb, diff, delta, fsim, csim, motion]
+        motion = self.pixel_motion_extractor(x) if cfg.use_motion else None
 
         rgb_features = self.rgb_encoder(x)
-        streams.insert(0, self.rgb_proj(rgb_features))
+        streams = [self.rgb_proj(rgb_features)]
 
         diff_features = None
-        if self.ablation.use_branch_b:
+        if cfg.use_branch_b:
             distances = [1, 4, 8, 16, 32]
             diffs = torch.zeros(b, t, c * len(distances), h, w, device=x.device, dtype=x.dtype)
             for i, dist in enumerate(distances):
                 if dist < t:
                     diffs[:, dist:, i*c:(i+1)*c] = x[:, dist:] - x[:, :-dist]
             diff_features = self.diff_encoder(diffs)
-            streams.insert(1, self.diff_proj(diff_features))
+            streams.append(self.diff_proj(diff_features))
 
-        relation_features = (
-            self.rgb_encoder.forward_per_frame(x)
-            if self.ablation.use_branch_c and self.ablation.rel_source == "pf"
-            else rgb_features
-        )
-        relation_features = self.feat_dropout(relation_features)
+        # Relational source: sharp per-frame features (Branch C) or Branch A (C4).
+        if cfg.use_branch_c and cfg.rel_source == "pf":
+            relation_features = self.rgb_encoder.forward_per_frame(x)
+        else:
+            relation_features = rgb_features
 
-        if self.ablation.use_delta:
+        if cfg.use_delta:
+            # Delta reads the features WITHOUT dropout (as in the original model).
             delta = torch.zeros_like(relation_features)
             delta[:, 1:] = relation_features[:, 1:] - relation_features[:, :-1]
             scale = delta.abs().mean(dim=(1, 2), keepdim=True).clamp(min=1e-6)
             streams.append(self.feat_delta_proj(delta / scale))
-        if self.ablation.use_fsim:
+        if cfg.use_fsim:
+            # Feature dropout applies only to the FrameSimilarity input.
+            sim_in = self.feat_dropout(relation_features)
             fsim = torch.cat([
-                self.frame_sim_short(relation_features),
-                self.frame_sim_medium(relation_features),
-                self.frame_sim_long(relation_features),
+                self.frame_sim_short(sim_in),
+                self.frame_sim_medium(sim_in),
+                self.frame_sim_long(sim_in),
             ], dim=-1)
             streams.append(self.frame_sim_proj(fsim))
-        if self.ablation.use_csim:
+        if cfg.use_csim:
             streams.append(self.color_sim_proj(self.color_hist_similarity(x)))
+        if cfg.use_motion:
+            streams.append(self.motion_norm(motion))
 
         fused = self.feature_proj(torch.cat(streams, dim=-1))
         for block in self.fusion_blocks:
             fused = block(fused)
 
-        if self.ablation.supervision == "unified":
+        if cfg.supervision == "unified":
             y_logits = self.detection_head(fused)
-            z_logits = torch.zeros_like(y_logits)
+            z_logits = None  # A2 has no z head; consumers must not read it
         else:
             y_logits, z_logits = self.detection_head(fused)
 
