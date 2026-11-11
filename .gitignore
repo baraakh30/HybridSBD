@@ -28,3 +28,9 @@ report/
 # The 21 checkpoints the paper needs are listed, with SHA-256, in checkpoints/MANIFEST.csv.
 /server_results/
 .DS_Store
+
+# Local-only analysis outputs (kept on disk, not in git)
+/feature_analysis_results/
+/presentation_materials/
+/threshold_detection_results/
+/visualization_results/
