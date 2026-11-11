@@ -1,0 +1,22 @@
+run,seed,used_in,file,size_mb,sha256,best_epoch,best_val_f1,parameters
+A0,42,"primary model: Tables 3, 4, 6-11",ablations_v2/A0/best_model.pt,41.9,8ec3feb706b601edd5c3482a9576a00f76ced91951b9ba584c47d0c05514d8ce,21,0.8029,10938880
+A1,42,Table 7 (supervision),ablations_v2/A1/best_model.pt,41.9,f694d472d085e3c98dd0b30d1936351d78972203aea5d7e7703699949e4a8a27,7,0.7863,10938880
+A2,42,Table 7 (supervision),ablations_v2/A2/best_model.pt,41.1,332666fc9489ef6db59290556d7cd4e8879d58afa56f415e5fce30a1062411b1,18,0.7895,10715775
+A3,42,Table 7 (supervision),ablations_v2/A3/best_model.pt,34.4,9a9e28f653fa52c0cc1a5362a893631fd915d724b3495e1e00af3d68fc9912e7,30,0.7965,8983570
+A4,42,Table 7 (supervision),ablations_v2/A4/best_model.pt,34.4,0125c80ffa1a6b79a3a295c8474b2852c25a4038ee68a38d42a2fd2ba268a048,30,0.7930,8983570
+C1,42,Table 10 (leave-one-out),ablations_v2/C1/best_model.pt,35.6,0b5d4be289db3bfc97395f5eb26eba70b9b33fa3f470cb842b1ff9259257ef63,16,0.7972,9293744
+C2a,42,Table 10 (leave-one-out),ablations_v2/C2a/best_model.pt,41.5,ebc578856e8c4708456b829072f330d31277bae224e545567939cb6275951eb8,26,0.7984,10833504
+C2b,42,Table 10 (leave-one-out),ablations_v2/C2b/best_model.pt,41.5,818dd5fef92e70051b9fdb07f6d7321113dbbf6c31001f34b0a8860e1daea3be,32,0.7929,10835936
+C3,42,Table 10 (leave-one-out),ablations_v2/C3/best_model.pt,41.6,54a5914e7018ad61d9c5752cc8ae6cef9c46374ade03de53ca13b9c7f6615fb9,22,0.7914,10848576
+C4,42,Table 10 (leave-one-out),ablations_v2/C4/best_model.pt,41.9,bb1ea9c7605136da4baf4808856a3222135977cfc4732a4b2c1999865cde6a7e,19,0.7953,10938880
+C5a,42,Table 10 (leave-one-out),ablations_v2/C5a/best_model.pt,41.9,01747bf212181d986c95155515631d35bc6f6e68cbc597ddbe79a71bb27902ff,19,0.7939,10927330
+C5b,42,Table 10 (leave-one-out),ablations_v2/C5b/best_model.pt,41.1,0bc04535346521ff09f2c115cdc1e51dfe737c84c7d0c0bca7a88f6692ee569d,21,0.8018,10716864
+C6,42,Table 10 (leave-one-out),ablations_v2/C6/best_model.pt,28.4,5c3c224e61e43005464450ba702df1961a49642e6b7fe5933729ad9fc37057c1,27,0.7939,7393792
+M0_min,42,Table 11 (build-up),ablations_v3/M0_min/best_model.pt,8.7,a0204fe8b99ac48c266bbec58a9659ca4aa0cd922c9ed053d3db9549a5d05b23,13,0.7667,2281074
+M1_edge,42,Table 11 (build-up),ablations_v3/M1_edge/best_model.pt,9.2,d9a21fb1232ab761d4ab4a25e7b29535db40cfe10bb73bf7148aa23ed84295f4,28,0.7781,2387986
+B_noatt,42,Table 11 (build-up),ablations_v3/B_noatt/best_model.pt,20.9,050810cdf4c8b87220966c68f0a39abd57b21aa3b0383bab79968780d4c76963,41,0.7852,5438482
+S1_rel,42,Table 11 (build-up),ablations_v3/S1_rel/best_model.pt,35.6,978edd6af015ce4d9f1f7fe782669cf4afda880e93bf15dcb6f9cdb2b5519c1a,22,0.7910,9282194
+A0_s43,43,Table 8 (seeds),seed_runs/A0_s43/A0/best_model.pt,41.9,36a413bc92ac731dd1ff8ec8917237b8fc340b3336839df59e5ee0690a383713,13,0.7953,10938880
+A0_s44,44,Table 8 (seeds),seed_runs/A0_s44/A0/best_model.pt,41.9,b99f58297df22b5cb1624e81d7e851b06947efd3c96dbb981884aa4e76dbe674,16,0.7935,10938880
+A1_s43,43,Table 8 (seeds),seed_runs/A1_s43/A1/best_model.pt,41.9,9089bd08431e57fef6364982df0e25108cdb54271892406753a6441758a57184,10,0.7915,10938880
+A1_s44,44,Table 8 (seeds),seed_runs/A1_s44/A1/best_model.pt,41.9,8cfe70c9af86cd4cd04c9c74fbcf77b75c44312ec30a2e8957ca1c64bffe4f99,9,0.7967,10938880

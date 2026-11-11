@@ -1,0 +1,21 @@
+[project]
+name = "hybridsbd"
+version = "1.0.0"
+description = "HybridSBD: dual-head shot boundary detection, with an ablation study of its components and supervision"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 140
+extend-exclude = ["server_results", "outputs", "reports"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E402", "E741", "E731"]  # long lines are left to the formatter; scripts set sys.path before importing the repo packages
+
+[tool.ruff.lint.isort]
+known-first-party = ["hybridsbd", "training", "evaluation", "benchmarks", "data_prep", "checks", "report_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_scoring.py"]

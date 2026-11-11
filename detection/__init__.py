@@ -1,4 +1,0 @@
-"""
-Detection methods module initialization.
-"""
-

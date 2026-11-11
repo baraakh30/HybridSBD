@@ -11,8 +11,8 @@ __pycache__/
 training_features/
 output/
 logs/
-models/
-data/
+/models/
+/data/
 *.pt
 *.pth
 hybrid_detector/
@@ -22,3 +22,9 @@ hybrid_detector3/
 wandb/
 outputs/
 report/
+.ruff_cache/
+
+# Large artefacts stay out of git: checkpoints (*.pt above), training outputs and server copies.
+# The 21 checkpoints the paper needs are listed, with SHA-256, in checkpoints/MANIFEST.csv.
+/server_results/
+.DS_Store
